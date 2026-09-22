@@ -1,0 +1,14 @@
+services:
+  staybusy:
+    image: imwl/staybusy:latest
+    container_name: staybusy
+    restart: always
+    # the program holds ~2.6 MiB; the limit is a seatbelt, not a requirement
+    mem_limit: 64m
+    # continuous 25% of the machine
+    command: ["-cpu", "25"]
+    # pulsed: 6 minutes busy per hour, 4% average
+    # command: ["-cpu", "40", "-duty", "10"]
+    # holding memory as well - raise mem_limit to match, or the request is clamped
+    # command: ["-cpu", "25", "-mem", "512M"]
+    # mem_limit: 1g
