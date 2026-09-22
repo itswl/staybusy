@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -38,14 +39,16 @@ const (
 )
 
 var (
-	flagCPU     = flag.Int("cpu", 0, "percentage of the whole machine's CPU to use while busy (1-100); 0 disables.\nLoad is spread over every core, so the figure means the same on any core count")
-	flagCores   = flag.Int("cores", 0, "how many cores to load; 0 means all of them")
-	flagPerCore = flag.Int("per-core", 0, "percentage of each loaded core (1-100). Takes precedence over -cpu:\nuse it when you want an exact number of cores at an exact load each")
-	flagDuty    = flag.Int("duty", 100, "percentage of time spent busy. 100 = continuous; 10 means 6 minutes\nper hour, which raises the upper decile of samples while averaging a tenth of the load")
-	flagCycle   = flag.Duration("cycle", time.Hour, "length of one duty cycle; applies when -duty < 100")
-	flagMem     = flag.String("mem", "0", "memory to hold: 512M / 1.5G / 1024K (a bare number means GiB); 0 disables")
-	flagNet     = flag.Int("net", 0, "sustained download rate in Mbps; 0 disables")
-	flagNetURL  = flag.String("net-url", "https://speed.cloudflare.com/__down?bytes=10485760", "download source (this endpoint returns 403 above 10 MB)")
+	flagCPU      = flag.Int("cpu", 0, "percentage of the whole machine's CPU to use while busy (1-100); 0 disables.\nLoad is spread over every core, so the figure means the same on any core count")
+	flagCores    = flag.Int("cores", 0, "how many cores to load; 0 means all of them")
+	flagPerCore  = flag.Int("per-core", 0, "percentage of each loaded core (1-100). Takes precedence over -cpu:\nuse it when you want an exact number of cores at an exact load each")
+	flagDuty     = flag.Int("duty", 100, "percentage of time spent busy. 100 = continuous; 10 means 6 minutes\nper hour, which raises the upper decile of samples while averaging a tenth of the load")
+	flagCycle    = flag.Duration("cycle", time.Hour, "length of one duty cycle; applies when -duty < 100")
+	flagMem      = flag.String("mem", "0", "memory to hold: 512M / 1.5G / 1024K (a bare number means GiB); 0 disables")
+	flagNet      = flag.Int("net", 0, "sustained download rate in Mbps; 0 disables")
+	flagNetUp    = flag.Int("net-up", 0, "sustained upload rate in Mbps; 0 disables. Runs alongside -net, so both\ndirections can be driven at once")
+	flagNetURL   = flag.String("net-url", "https://speed.cloudflare.com/__down?bytes=10485760", "download source (this endpoint returns 403 above 10 MB)")
+	flagNetUpURL = flag.String("net-up-url", "https://speed.cloudflare.com/__up", "upload target")
 )
 
 // hold keeps every allocated block reachable so the garbage collector leaves it
@@ -163,18 +166,19 @@ func eatMem(n int64) {
 	}
 }
 
-// pushNet downloads continuously, throttled to mbps: after each block it works
-// out how long that transfer should have taken at the target rate and sleeps
-// off the difference.
-func pushNet(mbps int, url string) {
+// pushNet drives traffic in one direction, throttled to mbps: after each block
+// it works out how long that transfer should have taken at the target rate and
+// sleeps off the difference. Download and upload run as independent instances,
+// so both directions can be driven at the same time.
+func pushNet(dir string, mbps int, url string, xfer func(*http.Client, string) (int64, error)) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	var total int64
 	report := time.Now()
 	for {
 		start := time.Now()
-		n, err := fetch(client, url)
+		n, err := xfer(client, url)
 		if err != nil {
-			logf("net: %v (retrying in 30s)", err)
+			logf("net %s: %v (retrying in 30s)", dir, err)
 			time.Sleep(30 * time.Second)
 			continue
 		}
@@ -184,17 +188,18 @@ func pushNet(mbps int, url string) {
 			time.Sleep(d)
 		}
 		if el := time.Since(report); el >= 5*time.Minute { // summarise rather than log every block
-			logf("net: %s over the last %s, about %.1f Mbps (target %d)",
-				humanSize(total), el.Round(time.Second), float64(total)*8/el.Seconds()/1e6, mbps)
+			logf("net %s: %s over the last %s, about %.1f Mbps (target %d)",
+				dir, humanSize(total), el.Round(time.Second), float64(total)*8/el.Seconds()/1e6, mbps)
 			total, report = 0, time.Now()
 		}
 	}
 }
 
-// fetch downloads once and returns the byte count. The status check matters:
+// download fetches once and returns the byte count. The status check matters:
 // an error page would otherwise count as a successful transfer and the dimension
-// would quietly do nothing (the endpoint above answers 403 with a 1-byte body).
-func fetch(client *http.Client, url string) (int64, error) {
+// would quietly do nothing (the default endpoint answers 403 with a 1-byte body
+// above 10 MB).
+func download(client *http.Client, url string) (int64, error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "staybusy/1.0")
 	resp, err := client.Do(req)
@@ -206,6 +211,32 @@ func fetch(client *http.Client, url string) (int64, error) {
 		return 0, fmt.Errorf("download source answered HTTP %d, try another -net-url", resp.StatusCode)
 	}
 	return io.Copy(io.Discard, resp.Body)
+}
+
+// upBlock is posted over and over. Filled once with random data: an all-zero
+// body would compress away on the wire and the measured rate would be a fiction.
+var upBlock = func() []byte {
+	b := make([]byte, 8*miB)
+	rand.Read(b)
+	return b
+}()
+
+// upload posts one block and returns the byte count.
+func upload(client *http.Client, url string) (int64, error) {
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(upBlock))
+	req.Header.Set("User-Agent", "staybusy/1.0")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(upBlock))
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("upload target answered HTTP %d, try another -net-up-url", resp.StatusCode)
+	}
+	return int64(len(upBlock)), nil
 }
 
 // parseSize reads "512M" / "1.5G" / "1024K". A bare number means GiB.
@@ -333,7 +364,7 @@ func main() {
 		fmt.Println("-duty must be between 1 and 100")
 		os.Exit(2)
 	}
-	if *flagCPU == 0 && *flagPerCore == 0 && mem == 0 && *flagNet == 0 {
+	if *flagCPU == 0 && *flagPerCore == 0 && mem == 0 && *flagNet == 0 && *flagNetUp == 0 {
 		fmt.Print("staybusy - put a controlled load on a machine\n\n")
 		flag.PrintDefaults()
 		return
@@ -368,9 +399,14 @@ func main() {
 		}
 	}
 	if *flagNet > 0 {
-		logf("net: sustaining about %d Mbps (%.2f TB/day) from %s", *flagNet,
+		logf("net down: about %d Mbps (%.2f TB/day) from %s", *flagNet,
 			float64(*flagNet)*86400/8/1e6, *flagNetURL)
-		go pushNet(*flagNet, *flagNetURL)
+		go pushNet("down", *flagNet, *flagNetURL, download)
+	}
+	if *flagNetUp > 0 {
+		logf("net up: about %d Mbps (%.2f TB/day) to %s", *flagNetUp,
+			float64(*flagNetUp)*86400/8/1e6, *flagNetUpURL)
+		go pushNet("up", *flagNetUp, *flagNetUpURL, upload)
 	}
 
 	// Not `select {}`: with only -mem set, the allocating goroutine finishes and

@@ -35,7 +35,9 @@ alerts, reproducing resource contention, and smoke-testing capacity limits.
 | `-cycle` | `1h` | length of one duty cycle; applies when `-duty < 100` |
 | `-mem` | `0` (off) | memory to hold: `512M` / `1.5G` / `1024K`; a bare number means GiB |
 | `-net` | `0` (off) | sustained download rate in Mbps |
+| `-net-up` | `0` (off) | sustained upload rate in Mbps; runs alongside `-net` |
 | `-net-url` | Cloudflare | download source |
+| `-net-up-url` | Cloudflare | upload target |
 
 ### Two ways to ask for CPU load
 
@@ -115,9 +117,24 @@ of the two budgets is used.
 
 ## Network
 
-`-net` takes a rate in **Mbps** and the downloads are paced to match it
-(target 20 measured 21.8). Off by default, since it is the one dimension that
-costs real bandwidth: the log line states the daily volume up front.
+Both directions, independently, in Mbps. They run at the same time:
+
+```bash
+staybusy -net 20              # download only
+staybusy -net-up 15           # upload only
+staybusy -net 20 -net-up 10   # both at once
+```
+
+Off by default, since this is the one dimension that costs real bandwidth — the
+log line states the daily volume up front, and every five minutes reports the
+rate actually achieved.
+
+**Pacing is per block, not smoothed.** Each block goes out at line speed and the
+process then sleeps off the difference, so the instantaneous rate alternates
+between a burst and idle while the average converges on the target. Measured over
+30s: `-net 20 -net-up 10` gave 21.8 and 13.4 Mbps, short-window overshoot from
+exactly that effect. If you need a flat profile rather than a correct average,
+this is not the right tool.
 
 ## Docker
 
