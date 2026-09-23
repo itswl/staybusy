@@ -11,13 +11,13 @@ The image's `CMD` is `-cpu 25`, so with no arguments it holds 25% of the machine
 CPU. The bare binary defaults `-cpu` to `0` and just prints help — **the 25% comes
 from the image, not from the program.**
 
-It drives three resources independently, each off by default:
+Three resources, each off by default and independently controllable:
 
 | resource | what it does |
 |---|---|
-| CPU | duty-cycled busy loop, as a percentage of the **whole machine** |
+| CPU | duty-cycled busy loop, continuous or pulsed |
 | memory | anonymous pages, allocated and written so they are really resident |
-| network | sustained downloads throttled to a target rate |
+| network | sustained transfers, either direction or both at once |
 
 Handy for exercising autoscaling rules, validating monitoring thresholds and
 alerts, reproducing resource contention, and smoke-testing capacity limits.
@@ -28,7 +28,7 @@ alerts, reproducing resource contention, and smoke-testing capacity limits.
 
 | flag | default | meaning |
 |---|---|---|
-| `-cpu` | `0` (off)<br>image `CMD` uses `25` | percentage of the **whole machine** while busy; spread over every core |
+| `-cpu` | `0` (off)<br>image `CMD` uses `25` | percentage of the **whole machine**, spread over every core |
 | `-cores` | `0` (all) | how many cores to load |
 | `-per-core` | `0` (off) | percentage of **each** loaded core; takes precedence over `-cpu` |
 | `-duty` | `100` | percentage of time spent busy. `100` = continuous, `10` = 6 min/hour |
@@ -39,7 +39,9 @@ alerts, reproducing resource contention, and smoke-testing capacity limits.
 | `-net-down-url` | Cloudflare | download source |
 | `-net-up-url` | Cloudflare | upload target |
 
-### Two ways to ask for CPU load
+## CPU
+
+### Two ways to ask for load
 
 ```bash
 staybusy -cpu 25                  # 25% of the whole machine, spread over every core
@@ -47,23 +49,24 @@ staybusy -cores 2 -per-core 50    # exactly 2 cores at 50% each, whatever the ma
 ```
 
 `-cpu` is the portable one: it means the same thing on any core count, because
-utilisation is averaged across cores. Note that this is why it has to be spread —
-one core at 25% is only 6.25% of a 4-core box, a quarter of what was asked for.
+utilisation is averaged across cores. That averaging is also why the load has to
+be spread — one core at 25% is only 6.25% of a 4-core box, a quarter of what was
+asked for.
 
-`-cores` + `-per-core` is the explicit one, for when you want a specific number of
-busy cores rather than a machine-wide figure. `-per-core` wins if both are given,
-and `-cores` is capped at the core count.
+`-cores` with `-per-core` is the literal one, for when you want a specific number
+of busy cores rather than a machine-wide figure. `-per-core` wins if both are
+given, and `-cores` is capped at the core count.
 
-The two can also be combined — `-cpu 15 -cores 2` concentrates a machine-wide
-target onto fewer cores, raising each to 82%. If the target is out of reach for
-that many cores it says so instead of quietly falling short:
+They compose: `-cpu 15 -cores 2` concentrates a machine-wide target onto fewer
+cores, raising each to 82%. When the target is out of reach for that many cores it
+says so rather than quietly falling short:
 
 ```
 $ staybusy -cpu 25 -cores 2       # on an 11-core machine
 cpu: 25% of the machine asked for, but 2 of 11 cores can only reach 18% - running them flat out
 ```
 
-## CPU: continuous or pulsed
+### Continuous or pulsed
 
 | mode | flags | average cost |
 |---|---|---|
@@ -82,17 +85,24 @@ burst level:
 
 That is the right shape when what you care about is a **high percentile** — the
 90th or 95th, say — rather than a mean. It is the wrong shape when the mean is
-what matters: 4% average is 4%, no matter how it is distributed. Continuous is
-the default because it satisfies either reading.
+what matters: 4% average is 4%, however it is distributed. Continuous is the
+default because it satisfies either reading.
 
-Measured whole-machine, against a 0.2% idle baseline:
+Measured on a single-core machine, process-level, with nothing else competing:
 
 ```
--cpu 25 -duty 100          -> 25.3% / 25.4%   flat
--cpu 40 -duty 10 -cycle 5m -> 40.3% 40.2% 32.3% -> 0.6% 0.1% 0.2%   30s busy, 4.5m idle
+-cpu 25                    -> 24%          -cpu 80  -> 78%
+-cores 1 -per-core 50      -> 49%
+-cpu 70 -duty 20 -cycle 20s -> 68% while busy, 0% between bursts
+-cpu 50 -duty 25           -> 12% averaged over full cycles (12.5% predicted)
 ```
 
-## Memory: clamped, never fatal
+> Duty-cycled load does not stack. Two processes each asking for 25% on one core
+> still total about 25%, not 50% — they contend rather than pile up. Convenient
+> (they cannot starve real work) but it does mean a busy machine will report less
+> than you asked for.
+
+## Memory
 
 A reserve of 512 MiB is always left to the system, and the request is clamped to
 fit — holding less is better than wedging the machine:
@@ -115,6 +125,8 @@ line claiming the allocation succeeded. The limit is read from
 `/sys/fs/cgroup/memory.max` (v2) or `memory.limit_in_bytes` (v1), and the smaller
 of the two budgets is used.
 
+Held memory is released when the process exits; the kernel reclaims it.
+
 ## Network
 
 Both directions, independently, in Mbps. They run at the same time:
@@ -126,15 +138,18 @@ staybusy -net-down 20 -net-up 10   # both at once
 ```
 
 Off by default, since this is the one dimension that costs real bandwidth — the
-log line states the daily volume up front, and every five minutes reports the
-rate actually achieved.
+log line states the daily volume up front, and every five minutes reports the rate
+actually achieved.
 
 **Pacing is per block, not smoothed.** Each block goes out at line speed and the
 process then sleeps off the difference, so the instantaneous rate alternates
 between a burst and idle while the average converges on the target. Measured over
-30s: `-net-down 20 -net-up 10` gave 21.8 and 13.4 Mbps, short-window overshoot from
-exactly that effect. If you need a flat profile rather than a correct average,
-this is not the right tool.
+30s, `-net-down 20 -net-up 10` gave 21.8 and 13.4 Mbps — short-window overshoot
+from exactly that effect. If you need a flat profile rather than a correct
+average, this is not the right tool.
+
+The upload buffer (8 MiB) is allocated on first use, so a run without `-net-up`
+does not carry it.
 
 ## Docker
 
@@ -147,14 +162,17 @@ runtime, so the image holds one executable and a CA bundle, and runs as
 docker run -d --name staybusy --restart always --memory 64m imwl/staybusy
 # pulsed
 docker run -d --name staybusy --restart always --memory 64m imwl/staybusy -cpu 40 -duty 10
+# both network directions
+docker run -d --name staybusy --restart always --memory 64m imwl/staybusy -net-down 20 -net-up 10
 # or use the compose file in this repo
 docker compose up -d
 ```
 
-`--memory 64m` is a seatbelt: the program itself holds 2.6 MiB, so that is ~25x
-headroom, and it means a future bug cannot take the host down with it. Raise the
-limit when using `-mem`, otherwise the allocation is clamped to whatever the
-cgroup allows — it will not crash, but it will hold less than you asked for.
+Resident set: **2.6 MiB** idle, **13 MiB** with `-net-up` in play, plus whatever
+`-mem` asks for. `--memory 64m` is a seatbelt — roughly 25x headroom on the base
+figure, and it means a future bug cannot take the host down with it. Raise the
+limit when using `-mem`, or the allocation is clamped to whatever the cgroup
+allows: it will not crash, but it will hold less than you asked for.
 
 > With `--restart always`, `docker stop` is undone immediately by the daemon,
 > which reads as "stopped but still running". To actually stop it:
@@ -182,11 +200,12 @@ Each of these cost a debugging session:
   reports as a deadlock and panics on. A sleep loop keeps a timer pending and is
   never considered deadlocked.
 - **CPU load is a duty cycle, not a spin.** Busy for N% of each 100 ms period,
-  then sleep, with `runtime.LockOSThread()` pinning the goroutine so the
-  scheduler cannot move it and skew the ratio.
-- **Duty-cycled load does not stack.** Two processes each asking for 25% on one
-  core still total about 25%, not 50%. They contend rather than pile up, which
-  also means they cannot starve real work.
-- **HTTP status has to be checked.** The default endpoint answers 403 with a
-  1-byte body above 10 MB; treating that as a successful transfer would leave the
-  network dimension quietly doing nothing.
+  then sleep, with `runtime.LockOSThread()` pinning the goroutine so the scheduler
+  cannot move it and skew the ratio.
+- **HTTP status has to be checked.** The default download endpoint answers 403
+  with a 1-byte body above 10 MB; treating that as a successful transfer would
+  leave the network dimension quietly doing nothing.
+- **Measuring this tool needs an idle machine.** Machine-wide readings include
+  everything else running, and on a contended core the duty cycle delivers less
+  than its nominal target. Process-level counters on an otherwise idle box are the
+  only way to see what it actually produces.

@@ -9,6 +9,8 @@ services:
     command: ["-cpu", "25"]
     # pulsed: 6 minutes busy per hour, 4% average
     # command: ["-cpu", "40", "-duty", "10"]
+    # both network directions
+    # command: ["-cpu", "25", "-net-down", "20", "-net-up", "10"]
     # holding memory as well - raise mem_limit to match, or the request is clamped
     # command: ["-cpu", "25", "-mem", "512M"]
     # mem_limit: 1g
