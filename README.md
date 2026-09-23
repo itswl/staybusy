@@ -4,7 +4,7 @@ Put a controlled, predictable load on a machine. Single file, no dependencies,
 static binary, 2.2 MB image.
 
 ```bash
-docker run -d --name staybusy --restart always --memory 64m imwl/staybusy
+docker run -d --name staybusy --restart always --memory 64m ghcr.io/itswl/staybusy
 ```
 
 The image's `CMD` is `-cpu 25`, so with no arguments it holds 25% of the machine's
@@ -159,11 +159,11 @@ runtime, so the image holds one executable and a CA bundle, and runs as
 
 ```bash
 # continuous 25%
-docker run -d --name staybusy --restart always --memory 64m imwl/staybusy
+docker run -d --name staybusy --restart always --memory 64m ghcr.io/itswl/staybusy
 # pulsed
-docker run -d --name staybusy --restart always --memory 64m imwl/staybusy -cpu 40 -duty 10
+docker run -d --name staybusy --restart always --memory 64m ghcr.io/itswl/staybusy -cpu 40 -duty 10
 # both network directions
-docker run -d --name staybusy --restart always --memory 64m imwl/staybusy -net-down 20 -net-up 10
+docker run -d --name staybusy --restart always --memory 64m ghcr.io/itswl/staybusy -net-down 20 -net-up 10
 # or use the compose file in this repo
 docker compose up -d
 ```
@@ -177,6 +177,10 @@ allows: it will not crash, but it will hold less than you asked for.
 > With `--restart always`, `docker stop` is undone immediately by the daemon,
 > which reads as "stopped but still running". To actually stop it:
 > `docker update --restart=no staybusy && docker stop staybusy`.
+
+Releases carry prebuilt binaries for linux and darwin on amd64 and arm64, with a
+`SHA256SUMS` alongside them. Tagging a commit `v*` builds and publishes both the
+binaries and the image.
 
 Building it yourself:
 

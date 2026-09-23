@@ -1,6 +1,6 @@
 services:
   staybusy:
-    image: imwl/staybusy:latest
+    image: ghcr.io/itswl/staybusy:latest
     container_name: staybusy
     restart: always
     # the program holds ~2.6 MiB; the limit is a seatbelt, not a requirement
