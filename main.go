@@ -213,16 +213,18 @@ func download(client *http.Client, url string) (int64, error) {
 	return io.Copy(io.Discard, resp.Body)
 }
 
-// upBlock is posted over and over. Filled once with random data: an all-zero
-// body would compress away on the wire and the measured rate would be a fiction.
-var upBlock = func() []byte {
-	b := make([]byte, 8*miB)
-	rand.Read(b)
-	return b
-}()
+// upBlock is posted over and over. Allocated on first use rather than at
+// startup, so a run without -net-up does not carry 8 MiB it will never touch.
+// Filled with random data: an all-zero body would compress away on the wire and
+// the measured rate would be a fiction.
+var upBlock []byte
 
 // upload posts one block and returns the byte count.
 func upload(client *http.Client, url string) (int64, error) {
+	if upBlock == nil { // only ever called from the single upload goroutine
+		upBlock = make([]byte, 8*miB)
+		rand.Read(upBlock)
+	}
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(upBlock))
 	req.Header.Set("User-Agent", "staybusy/1.0")
 	req.Header.Set("Content-Type", "application/octet-stream")
