@@ -34,7 +34,7 @@ jobs:
       - name: flags match the docs
         run: |
           fail=0
-          for f in $(./staybusy | grep -oE '^  -[a-z-]+' | tr -d ' '); do
+          for f in $(./staybusy 2>&1 | grep -oE '^  -[a-z-]+' | tr -d ' '); do
             grep -q -- "\`$f\`" README.md || { echo "undocumented: $f"; fail=1; }
           done
           for f in $(grep -oE '`-[a-z-]+`' README.md | tr -d '`' | sort -u); do

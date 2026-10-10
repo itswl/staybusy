@@ -166,3 +166,95 @@ func TestLimiterHugeReadDoesNotHang(t *testing.T) {
 		t.Fatal("wait on a read larger than the burst blocked forever")
 	}
 }
+
+func TestParseSchedule(t *testing.T) {
+	if s, err := parseSchedule(""); err != nil || s != nil {
+		t.Fatalf("parseSchedule(\"\") = %v, %v", s, err)
+	}
+	s, err := parseSchedule(" 80, 20 ,0 ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s) != 3 || s[0] != 80 || s[1] != 20 || s[2] != 0 {
+		t.Errorf("got %v, want [80 20 0]", s)
+	}
+	for _, bad := range []string{"80,x", "101", "-1", "80,,0"} {
+		if _, err := parseSchedule(bad); err == nil {
+			t.Errorf("parseSchedule(%q) should fail", bad)
+		}
+	}
+}
+
+func TestCPUShapeSchedule(t *testing.T) {
+	s := &cpuShape{ncpu: 4, workers: 4, target: 50, cycle: 3 * time.Minute,
+		schedule: []int{80, 20, 0}, duty: 100, start: time.Now()}
+	if got := s.level(); got != 80 {
+		t.Errorf("slot 0 = %d, want 80", got)
+	}
+	s.start = time.Now().Add(-90 * time.Second)
+	if got := s.level(); got != 20 {
+		t.Errorf("slot 1 = %d, want 20", got)
+	}
+	s.start = time.Now().Add(-150 * time.Second)
+	if got := s.level(); got != 0 {
+		t.Errorf("slot 2 = %d, want 0", got)
+	}
+}
+
+func TestCPUShapeRamp(t *testing.T) {
+	s := &cpuShape{ncpu: 1, workers: 1, target: 100, ramp: 10 * time.Second,
+		cycle: time.Hour, duty: 100, start: time.Now().Add(-5 * time.Second)}
+	if got := s.level(); got < 40 || got > 60 {
+		t.Errorf("mid-ramp = %d, want about 50", got)
+	}
+	s.start = time.Now().Add(-20 * time.Second)
+	if got := s.level(); got != 100 {
+		t.Errorf("ramp done = %d, want 100", got)
+	}
+}
+
+func TestCPUShapeDuty(t *testing.T) {
+	s := &cpuShape{ncpu: 1, workers: 1, target: 80, duty: 50,
+		cycle: time.Minute, start: time.Now().Add(-10 * time.Second)}
+	if got := s.level(); got != 80 {
+		t.Errorf("within burn = %d, want 80", got)
+	}
+	s.start = time.Now().Add(-40 * time.Second)
+	if got := s.level(); got != 0 {
+		t.Errorf("after burn = %d, want 0", got)
+	}
+}
+
+func TestCPUShapeWorkerScaling(t *testing.T) {
+	s := &cpuShape{ncpu: 4, workers: 2, target: 50, duty: 100, cycle: time.Hour, start: time.Now()}
+	if got := s.workerPct(); got != 100 {
+		t.Errorf("workerPct = %d, want 100 (50%% of 4 cores over 2 workers)", got)
+	}
+}
+
+func TestConfigValue(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"x", "x"},
+		{true, "true"},
+		{false, "false"},
+		{float64(20), "20"},
+		{float64(1.5), "1.5"},
+	}
+	for _, c := range cases {
+		if got := configValue(c.in); got != c.want {
+			t.Errorf("configValue(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDarwinAvail(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	if got := darwinAvail(); got <= 0 {
+		t.Errorf("darwinAvail() = %d, want > 0", got)
+	}
+}

@@ -11,6 +11,11 @@ services:
     # command: ["-cpu", "40", "-duty", "10"]
     # both network directions
     # command: ["-cpu", "25", "-net-down", "20", "-net-up", "10"]
+    # disk load (needs a writable volume at /tmp)
+    # command: ["-disk-write", "50", "-disk-size", "512M"]
+    # load target + metrics for other instances to hit
+    # command: ["-serve", ":8080"]
+    # ports: ["8080:8080"]
     # holding memory as well - raise mem_limit to match, or the request is clamped
     # command: ["-cpu", "25", "-mem", "512M"]
     # mem_limit: 1g

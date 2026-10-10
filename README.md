@@ -11,16 +11,20 @@ The image's `CMD` is `-cpu 25`, so with no arguments it holds 25% of the machine
 CPU. The bare binary defaults `-cpu` to `0` and just prints help — **the 25% comes
 from the image, not from the program.**
 
-Three resources, each off by default and independently controllable:
+Four resources, each off by default and independently controllable:
 
 | resource | what it does |
 |---|---|
-| CPU | duty-cycled busy loop, continuous or pulsed |
+| CPU | duty-cycled busy loop, continuous, pulsed, ramped or scheduled |
 | memory | anonymous pages, allocated and written so they are really resident |
 | network | sustained transfers, either direction or both at once |
+| disk | sustained reads and/or writes, throttled to a target rate |
 
 Handy for exercising autoscaling rules, validating monitoring thresholds and
-alerts, reproducing resource contention, and smoke-testing capacity limits.
+alerts, reproducing resource contention, and smoke-testing capacity limits. It
+can also run for a fixed time (`-duration`), serve load to another instance and
+expose Prometheus metrics (`-serve`), and be configured from the environment or
+a file.
 
 ---
 
@@ -32,12 +36,27 @@ alerts, reproducing resource contention, and smoke-testing capacity limits.
 | `-cores` | `0` (all) | how many cores to load |
 | `-per-core` | `0` (off) | percentage of **each** loaded core; takes precedence over `-cpu` |
 | `-duty` | `100` | percentage of time spent busy. `100` = continuous, `10` = 6 min/hour |
-| `-cycle` | `1h` | length of one duty cycle; applies when `-duty < 100` |
+| `-cycle` | `1h` | length of one duty cycle (when `-duty < 100`) or of one `-schedule` pass |
+| `-ramp` | `0` (off) | ramp CPU from 0 up to its target over this period at startup |
+| `-schedule` | (off) | comma-separated CPU percentages to cycle through, e.g. `80,20,0` |
 | `-mem` | `0` (off) | memory to hold: `512M` / `1.5G` / `1024K`; a bare number means GiB |
 | `-net-down` | `0` (off) | sustained download rate in Mbps |
 | `-net-up` | `0` (off) | sustained upload rate in Mbps; runs alongside `-net-down` |
 | `-net-down-url` | Cloudflare | download source |
 | `-net-up-url` | Cloudflare | upload target |
+| `-net-conns` | `1` | concurrent connections per direction |
+| `-net-rps` | `0` (off) | requests per second per direction, on top of the byte rate |
+| `-disk-read` | `0` (off) | sustained disk read rate in MB/s |
+| `-disk-write` | `0` (off) | sustained disk write rate in MB/s |
+| `-disk-size` | `512M` | size of the file used for disk load |
+| `-disk-dir` | temp dir | directory for the disk file |
+| `-disk-fsync` | off | fsync after each written pass so writes are durable |
+| `-disk-direct` | off | `O_DIRECT` on Linux to bypass the page cache (ignored elsewhere) |
+| `-serve` | (off) | listen address for the built-in load endpoint and metrics, e.g. `:8080` |
+| `-duration` | `0` (forever) | stop after this long |
+| `-check` | off | with `-duration`, exit non-zero if a measured rate came in under target |
+| `-config` | (off) | JSON file of flag values (command line and environment win) |
+| `-log-json` | off | write logs as JSON lines |
 | `-version` | | print the version and exit |
 
 ## CPU
@@ -153,6 +172,87 @@ fraction of a block rather than the block itself.
 The upload buffer (8 MiB) is allocated on first use, so a run without `-net-up`
 does not carry it.
 
+`-net-conns` opens several connections at once; the byte rate is the total across
+them. `-net-rps` adds a request-rate cap on top. For a self-contained pair, run
+one instance with `-serve` and point another at it (see below) so no external
+endpoint is involved.
+
+## Disk
+
+Reads and writes, independently, in MB/s:
+
+```bash
+staybusy -disk-write 50                       # write 50 MB/s
+staybusy -disk-read 100                       # read 100 MB/s
+staybusy -disk-write 50 -disk-read 100        # both at once
+```
+
+Each direction keeps a file of `-disk-size` (default 512 MiB) in `-disk-dir`
+(the OS temp dir by default) and loops over it, paced by the same token bucket
+the network uses. The read file is filled with real data once on first use, so
+reads are not served from untouched sparse holes. Files are removed on a clean
+exit.
+
+```bash
+staybusy -disk-write 200 -disk-fsync          # durable: fsync after each pass
+staybusy -disk-read 500 -disk-direct          # Linux: O_DIRECT, bypass the page cache
+```
+
+`-disk-direct` needs offsets and lengths that are a multiple of the device
+block, so the size is rounded up to a whole MiB; the flag is ignored off Linux
+and falls back silently if the filesystem rejects `O_DIRECT`. Without it the
+page cache will absorb much of a read, so for a read test that actually hits the
+disk either use `-disk-direct` or a file larger than RAM.
+
+## Serve and metrics
+
+`-serve :8080` turns the instance into a load target and a metrics endpoint,
+sharing one listener:
+
+| path | what it does |
+|---|---|
+| `GET /down[?bytes=N]` | streams random bytes (unbounded without `?bytes`) |
+| `POST /up` | discards the request body |
+| `GET /healthz` | `ok` |
+| `GET /metrics` | Prometheus text: targets, throughput counters, uptime |
+
+That makes a self-contained pair — no external endpoint, no 10 MB gotcha:
+
+```bash
+staybusy -serve :8080 &                                  # the target
+staybusy -net-down 200 -net-down-url http://host:8080/down
+staybusy -net-up 50   -net-up-url   http://host:8080/up
+```
+
+## Duration, exit code and logging
+
+`-duration 30m` stops the process after the given time, which makes it usable
+from cron or CI. With `-check` it also compares the rates it actually achieved
+against the targets and exits non-zero if any came in under, so a smoke test can
+assert on the exit code:
+
+```bash
+staybusy -net-down 100 -duration 60s -check    # exit 1 if it never got near 100 Mbps
+```
+
+The bar is deliberately loose — a short run spends its first seconds warming up
+— so treat `-check` as a coarse smoke test, not a measurement. `-log-json` emits
+one JSON object per line (`{"time":...,"msg":...}`) instead of timestamped text.
+
+## Configuration
+
+Every flag can also be set from the environment as `STAYBUSY_` plus the flag name
+upper-cased with dashes as underscores (`STAYBUSY_NET_DOWN`, `STAYBUSY_DISK_READ`,
+…), or from a `-config` JSON file:
+
+```json
+{ "cpu": 25, "net-down": 20, "net-up": 10, "duration": "30m" }
+```
+
+Precedence is command line, then environment, then config file, then the built-in
+default. This is what makes the image comfortable under Kubernetes, where the
+alternative is a long `args:` list.
+
 ## Docker
 
 The image is built `FROM scratch`. A static binary needs no libc, no shell and no
@@ -180,7 +280,8 @@ allows: it will not crash, but it will hold less than you asked for.
 > which reads as "stopped but still running". To actually stop it:
 > `docker update --restart=no staybusy && docker stop staybusy`.
 
-Releases carry prebuilt binaries for linux and darwin on amd64 and arm64, with a
+Releases carry prebuilt binaries for linux, darwin and windows on amd64 and
+arm64, with a
 `SHA256SUMS` alongside them. Tagging a commit `v*` builds and publishes both the
 binaries and the image.
 
@@ -214,11 +315,19 @@ Each of these cost a debugging session:
   of the budget.
 - **A duty cycle with a zero-length phase respawns without bound.** `-cycle 0`, or
   a cycle shorter than one duty period, made the pulse loop spin up a fresh set of
-  workers on every iteration with no sleep between; the cycle is now validated
-  positive and the busy leg floored.
+  workers on every iteration with no sleep between. It is gone: workers now read a
+  shape each pass and spin accordingly, so `-duty`, `-ramp` and `-schedule` share
+  one mechanism and nothing is ever respawned.
 - **`-cores` over the core count used to zero the load.** Integer division spread
   `-cpu 5 -cores 200` over 200 workers, gave each 0%, and ran nothing. The worker
   count is clamped to the cores, as the docs always claimed.
+- **A streaming transfer never completes, so counting on completion reads zero.**
+  Bytes are added to the counter as they are read, not when a request returns —
+  otherwise a request against the unbounded `/down` endpoint shows no throughput at
+  all until it ends, which is never.
+- **O_DIRECT without a platform file.** The flag value is a plain constant applied
+  only when `runtime.GOOS == "linux"`, so the file stays free of build tags and
+  still cross-compiles to darwin and windows, where the flag is ignored.
 - **CPU load is a duty cycle, not a spin.** Busy for N% of each 100 ms period,
   then sleep, with `runtime.LockOSThread()` pinning the goroutine so the scheduler
   cannot move it and skew the ratio.
