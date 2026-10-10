@@ -1,0 +1,33 @@
+# Example Deployment for staybusy.
+#
+# Replace the image with your own registry. Load is machine-local, so if you want
+# one instance per node use a DaemonSet instead of a Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: staybusy
+  labels:
+    app: staybusy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: staybusy
+  template:
+    metadata:
+      labels:
+        app: staybusy
+    spec:
+      containers:
+        - name: staybusy
+          image: ghcr.io/you/staybusy:latest
+          # Keep the image's default CMD (-cpu 25) or override it here, e.g.:
+          #   args: ["-cpu", "40", "-duty", "10", "-duration", "30m"]
+          # Every flag also has a STAYBUSY_* environment variable.
+          args: ["-cpu", "25"]
+          resources:
+            limits:
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534

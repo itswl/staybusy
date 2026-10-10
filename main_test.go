@@ -118,6 +118,60 @@ func TestCPUPlan(t *testing.T) {
 	})
 }
 
+func setKnobs(cpuPct, duty int, cycle time.Duration) {
+	knobs.cpuPct.Store(int64(cpuPct))
+	knobs.duty.Store(int64(duty))
+	knobs.cycleNs.Store(int64(cycle))
+}
+
+func TestCPUShapeSchedule(t *testing.T) {
+	setKnobs(50, 100, 3*time.Minute)
+	s := &cpuShape{ncpu: 4, workers: 4, schedule: []int{80, 20, 0}, start: time.Now()}
+	if got := s.level(); got != 80 {
+		t.Errorf("slot 0 = %d, want 80", got)
+	}
+	s.start = time.Now().Add(-90 * time.Second)
+	if got := s.level(); got != 20 {
+		t.Errorf("slot 1 = %d, want 20", got)
+	}
+	s.start = time.Now().Add(-150 * time.Second)
+	if got := s.level(); got != 0 {
+		t.Errorf("slot 2 = %d, want 0", got)
+	}
+}
+
+func TestCPUShapeRamp(t *testing.T) {
+	setKnobs(100, 100, time.Hour)
+	s := &cpuShape{ncpu: 1, workers: 1, ramp: 10 * time.Second, start: time.Now().Add(-5 * time.Second)}
+	if got := s.level(); got < 40 || got > 60 {
+		t.Errorf("mid-ramp = %d, want about 50", got)
+	}
+	s.start = time.Now().Add(-20 * time.Second)
+	if got := s.level(); got != 100 {
+		t.Errorf("ramp done = %d, want 100", got)
+	}
+}
+
+func TestCPUShapeDuty(t *testing.T) {
+	setKnobs(80, 50, time.Minute)
+	s := &cpuShape{ncpu: 1, workers: 1, start: time.Now().Add(-10 * time.Second)}
+	if got := s.level(); got != 80 {
+		t.Errorf("within burn = %d, want 80", got)
+	}
+	s.start = time.Now().Add(-40 * time.Second)
+	if got := s.level(); got != 0 {
+		t.Errorf("after burn = %d, want 0", got)
+	}
+}
+
+func TestCPUShapeWorkerScaling(t *testing.T) {
+	setKnobs(50, 100, time.Hour)
+	s := &cpuShape{ncpu: 4, workers: 2, start: time.Now()}
+	if got := s.workerPct(); got != 100 {
+		t.Errorf("workerPct = %d, want 100 (50%% of 4 cores over 2 workers)", got)
+	}
+}
+
 func TestReserveFromBudget(t *testing.T) {
 	cases := []struct {
 		budget int64
@@ -135,35 +189,21 @@ func TestReserveFromBudget(t *testing.T) {
 	}
 }
 
-func TestLimiterPaces(t *testing.T) {
-	l := newLimiter(8e6) // 8 MB/s; burst is 1.6 MB
-	if l.burst < 64*kiB {
-		t.Fatalf("burst floor not applied: %v", l.burst)
+func TestDiskRate(t *testing.T) {
+	cases := []struct {
+		mbs, iops int
+		block     int64
+		want      int64
+	}{
+		{0, 0, 1 * miB, 0},
+		{50, 0, 1 * miB, 50_000_000},
+		{0, 1000, 4096, 1000 * 4096},
+		{50, 1000, 4096, 1000 * 4096}, // iops wins
 	}
-	l.wait(int(l.burst)) // spend the initial burst so timing reflects the rate
-
-	start := time.Now()
-	const chunk = 256 * kiB
-	for i := 0; i < 8; i++ { // 2 MiB at 8 MB/s -> about 0.26 s
-		l.wait(chunk)
-	}
-	if el := time.Since(start); el < 100*time.Millisecond {
-		t.Fatalf("limiter did not pace: 2 MiB went out in %s", el)
-	}
-}
-
-// A read larger than the burst must not wait for tokens that can never accrue.
-func TestLimiterHugeReadDoesNotHang(t *testing.T) {
-	l := newLimiter(1e6)
-	done := make(chan struct{})
-	go func() {
-		l.wait(50 * miB)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("wait on a read larger than the burst blocked forever")
+	for _, c := range cases {
+		if got := diskRate(c.mbs, c.iops, c.block); got != c.want {
+			t.Errorf("diskRate(%d,%d,%d) = %d, want %d", c.mbs, c.iops, c.block, got, c.want)
+		}
 	}
 }
 
@@ -185,50 +225,46 @@ func TestParseSchedule(t *testing.T) {
 	}
 }
 
-func TestCPUShapeSchedule(t *testing.T) {
-	s := &cpuShape{ncpu: 4, workers: 4, target: 50, cycle: 3 * time.Minute,
-		schedule: []int{80, 20, 0}, duty: 100, start: time.Now()}
-	if got := s.level(); got != 80 {
-		t.Errorf("slot 0 = %d, want 80", got)
+func TestApplyProfileStep(t *testing.T) {
+	setKnobs(0, 100, time.Hour)
+	step := profileStep{CPU: intp(80), NetDown: intp(20), Duty: intp(25)}
+	applyStep(step)
+	if got := knobs.cpuPct.Load(); got != 80 {
+		t.Errorf("cpuPct = %d, want 80", got)
 	}
-	s.start = time.Now().Add(-90 * time.Second)
-	if got := s.level(); got != 20 {
-		t.Errorf("slot 1 = %d, want 20", got)
+	// 20 Mbps in bytes per second
+	if got, want := knobs.netDown.Load(), int64(20*1e6/8); got != want {
+		t.Errorf("netDown = %d, want %d", got, want)
 	}
-	s.start = time.Now().Add(-150 * time.Second)
-	if got := s.level(); got != 0 {
-		t.Errorf("slot 2 = %d, want 0", got)
+	if got := knobs.duty.Load(); got != 25 {
+		t.Errorf("duty = %d, want 25", got)
 	}
-}
-
-func TestCPUShapeRamp(t *testing.T) {
-	s := &cpuShape{ncpu: 1, workers: 1, target: 100, ramp: 10 * time.Second,
-		cycle: time.Hour, duty: 100, start: time.Now().Add(-5 * time.Second)}
-	if got := s.level(); got < 40 || got > 60 {
-		t.Errorf("mid-ramp = %d, want about 50", got)
-	}
-	s.start = time.Now().Add(-20 * time.Second)
-	if got := s.level(); got != 100 {
-		t.Errorf("ramp done = %d, want 100", got)
+	// An absent field is left alone.
+	applyStep(profileStep{CPU: intp(10)})
+	if got := knobs.netDown.Load(); got != 20*1e6/8 {
+		t.Errorf("netDown changed to %d, want it untouched", got)
 	}
 }
 
-func TestCPUShapeDuty(t *testing.T) {
-	s := &cpuShape{ncpu: 1, workers: 1, target: 80, duty: 50,
-		cycle: time.Minute, start: time.Now().Add(-10 * time.Second)}
-	if got := s.level(); got != 80 {
-		t.Errorf("within burn = %d, want 80", got)
+func intp(v int) *int { return &v }
+
+func TestKnobState(t *testing.T) {
+	knobs.netDown.Store(20 * 1e6 / 8)
+	knobs.diskRead.Store(50 * 1e6)
+	st := knobState()
+	if st["net_down_mbps"].(float64) != 20 {
+		t.Errorf("net_down_mbps = %v, want 20", st["net_down_mbps"])
 	}
-	s.start = time.Now().Add(-40 * time.Second)
-	if got := s.level(); got != 0 {
-		t.Errorf("after burn = %d, want 0", got)
+	if st["disk_read_mbs"].(float64) != 50 {
+		t.Errorf("disk_read_mbs = %v, want 50", st["disk_read_mbs"])
 	}
 }
 
-func TestCPUShapeWorkerScaling(t *testing.T) {
-	s := &cpuShape{ncpu: 4, workers: 2, target: 50, duty: 100, cycle: time.Hour, start: time.Now()}
-	if got := s.workerPct(); got != 100 {
-		t.Errorf("workerPct = %d, want 100 (50%% of 4 cores over 2 workers)", got)
+func TestPulseActiveAlwaysOnAtFullDuty(t *testing.T) {
+	knobs.duty.Store(100)
+	knobs.cycleNs.Store(int64(time.Second))
+	if !pulseActive() {
+		t.Error("duty 100 should always be active")
 	}
 }
 
@@ -247,6 +283,39 @@ func TestConfigValue(t *testing.T) {
 		if got := configValue(c.in); got != c.want {
 			t.Errorf("configValue(%v) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestLimiterPaces(t *testing.T) {
+	l := newLimiter(8e6) // 8 MB/s; burst is 1.6 MB
+	if l.burst < 64*kiB {
+		t.Fatalf("burst floor not applied: %v", l.burst)
+	}
+	l.wait(int(l.burst)) // spend the initial burst so timing reflects the rate
+
+	start := time.Now()
+	const chunk = 256 * kiB
+	for i := 0; i < 8; i++ { // 2 MiB at 8 MB/s -> about 0.26 s
+		l.wait(chunk)
+	}
+	if el := time.Since(start); el < 100*time.Millisecond {
+		t.Fatalf("limiter did not pace: 2 MiB went out in %s", el)
+	}
+}
+
+// A read larger than the burst is charged in full, so it waits its true
+// duration and then returns - it must not block forever.
+func TestLimiterHugeReadDoesNotHang(t *testing.T) {
+	l := newLimiter(1e6) // 1 MB/s, burst 64 KiB
+	done := make(chan struct{})
+	go func() {
+		l.wait(500_000) // 0.5 MB -> about 0.5 s after the initial burst
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait on a read larger than the burst blocked forever")
 	}
 }
 

@@ -1,11 +1,16 @@
 // staybusy places a controlled, predictable load on a machine.
 //
-// It can drive four resources independently:
+// It can drive several kinds of load independently:
 //
 //	CPU     a duty-cycled busy loop, expressed as a percentage of the whole machine
 //	memory  anonymous pages, allocated and touched so they are really resident
+//	         -mem-bw adds sustained memory bandwidth instead
 //	network sustained transfers, up and/or down, throttled to a target rate
-//	disk    sustained reads and/or writes, throttled to a target rate
+//	disk    sustained reads and/or writes, throttled to a target rate or an IOPS
+//	process -procs forks children, -threads holds OS threads, -fds holds handles
+//
+// Load can be changed at runtime over HTTP (-serve exposes /control) or scripted
+// over time (-profile), and the whole thing can run for a fixed -duration.
 //
 // Useful for exercising autoscaling rules, validating monitoring thresholds and
 // alerts, reproducing resource contention, and smoke-testing capacity limits.
@@ -22,6 +27,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -38,6 +44,10 @@ import (
 // version is stamped at build time: -ldflags "-X main.version=v1.2.3".
 var version = "dev"
 
+// childToken marks a re-exec of ourselves as an inert child for -procs. It is not
+// a flag, so it stays out of the help and the docs.
+const childToken = "--staybusy-child"
+
 const (
 	kiB = 1024
 	miB = 1024 * kiB
@@ -50,11 +60,6 @@ const (
 	// minMem: below this there is no point allocating, so the dimension is skipped.
 	minMem = 64 * miB
 
-	// diskBlock is the I/O granularity for the disk dimension. O_DIRECT wants
-	// offsets and lengths that are a multiple of the device block, so this is a
-	// whole MiB.
-	diskBlock = 1 * miB
-
 	// linuxO_DIRECT is O_DIRECT on linux/amd64 and linux/arm64 (both 040000).
 	// Kept as a plain number so the file stays platform-independent; it is only
 	// ever used when runtime.GOOS == "linux".
@@ -62,52 +67,151 @@ const (
 )
 
 var (
-	flagCPU        = flag.Int("cpu", 0, "percentage of the whole machine's CPU to use while busy (1-100); 0 disables.\nLoad is spread over every core, so the figure means the same on any core count")
-	flagCores      = flag.Int("cores", 0, "how many cores to load; 0 means all of them")
-	flagPerCore    = flag.Int("per-core", 0, "percentage of each loaded core (1-100). Takes precedence over -cpu:\nuse it when you want an exact number of cores at an exact load each")
-	flagDuty       = flag.Int("duty", 100, "percentage of time spent busy. 100 = continuous; 10 means 6 minutes\nper hour, which raises the upper decile of samples while averaging a tenth of the load")
-	flagCycle      = flag.Duration("cycle", time.Hour, "length of one duty cycle (when -duty < 100) or of one -schedule pass")
-	flagRamp       = flag.Duration("ramp", 0, "ramp CPU from 0 up to its target over this period at startup; 0 disables")
-	flagSchedule   = flag.String("schedule", "", "comma-separated CPU percentages of the machine to cycle through, each\nheld for an equal slice of -cycle (e.g. 80,20,0)")
-	flagMem        = flag.String("mem", "0", "memory to hold: 512M / 1.5G / 1024K (a bare number means GiB); 0 disables")
-	flagNetDown    = flag.Int("net-down", 0, "sustained download rate in Mbps; 0 disables")
-	flagNetUp      = flag.Int("net-up", 0, "sustained upload rate in Mbps; 0 disables. Runs alongside -net-down, so\nboth directions can be driven at once")
-	flagNetDownURL = flag.String("net-down-url", "https://speed.cloudflare.com/__down?bytes=10485760", "download source (this endpoint returns 403 above 10 MB)")
-	flagNetUpURL   = flag.String("net-up-url", "https://speed.cloudflare.com/__up", "upload target")
-	flagNetConns   = flag.Int("net-conns", 1, "concurrent connections per direction")
-	flagNetRPS     = flag.Int("net-rps", 0, "requests per second per direction, on top of the byte rate; 0 disables")
-	flagDiskRead   = flag.Int("disk-read", 0, "sustained disk read rate in MB/s; 0 disables")
-	flagDiskWrite  = flag.Int("disk-write", 0, "sustained disk write rate in MB/s; 0 disables")
-	flagDiskSize   = flag.String("disk-size", "512M", "size of the file used for disk load: 512M / 1G / ...; a bare number means GiB")
-	flagDiskDir    = flag.String("disk-dir", "", "directory for the disk file (default the OS temp dir)")
-	flagDiskFsync  = flag.Bool("disk-fsync", false, "fsync after each written pass so the writes are durable")
-	flagDiskDirect = flag.Bool("disk-direct", false, "open the disk file with O_DIRECT on Linux to bypass the page cache (ignored elsewhere)")
-	flagServe      = flag.String("serve", "", "listen address for the built-in load endpoint and metrics, e.g. :8080")
-	flagDuration   = flag.Duration("duration", 0, "stop after this long; 0 runs until signalled")
-	flagCheck      = flag.Bool("check", false, "with -duration, exit non-zero if a measured rate came in under its target")
-	flagConfig     = flag.String("config", "", "JSON file of flag values; command line and environment take precedence")
-	flagLogJSON    = flag.Bool("log-json", false, "write logs as JSON lines")
-	flagVersion    = flag.Bool("version", false, "print the version and exit")
+	flagCPU           = flag.Int("cpu", 0, "percentage of the whole machine's CPU to use while busy (1-100); 0 disables.\nLoad is spread over every core, so the figure means the same on any core count")
+	flagCores         = flag.Int("cores", 0, "how many cores to load; 0 means all of them")
+	flagPerCore       = flag.Int("per-core", 0, "percentage of each loaded core (1-100). Takes precedence over -cpu:\nuse it when you want an exact number of cores at an exact load each")
+	flagDuty          = flag.Int("duty", 100, "percentage of time spent busy, across every dimension.\n100 = continuous; 10 means 6 minutes per hour, raising the upper decile of samples")
+	flagCycle         = flag.Duration("cycle", time.Hour, "length of one duty cycle, or of one -schedule pass")
+	flagRamp          = flag.Duration("ramp", 0, "ramp CPU from 0 up to its target over this period at startup; 0 disables")
+	flagSchedule      = flag.String("schedule", "", "comma-separated CPU percentages of the machine to cycle through, each\nheld for an equal slice of -cycle (e.g. 80,20,0)")
+	flagProfile       = flag.String("profile", "", "JSON file of timed steps that change the load over time")
+	flagMem           = flag.String("mem", "0", "memory to hold: 512M / 1.5G / 1024K (a bare number means GiB); 0 disables")
+	flagMemBW         = flag.Int("mem-bw", 0, "sustained memory bandwidth in MB/s; 0 disables")
+	flagMemBWSize     = flag.String("mem-bw-size", "256M", "buffer size for -mem-bw")
+	flagNetDown       = flag.Int("net-down", 0, "sustained download rate in Mbps; 0 disables")
+	flagNetUp         = flag.Int("net-up", 0, "sustained upload rate in Mbps; 0 disables. Runs alongside -net-down, so\nboth directions can be driven at once")
+	flagNetDownURL    = flag.String("net-down-url", "https://speed.cloudflare.com/__down?bytes=10485760", "download source (this endpoint returns 403 above 10 MB)")
+	flagNetUpURL      = flag.String("net-up-url", "https://speed.cloudflare.com/__up", "upload target")
+	flagNetConns      = flag.Int("net-conns", 1, "concurrent connections per direction")
+	flagNetRPS        = flag.Int("net-rps", 0, "requests per second per direction, on top of the byte rate; 0 disables")
+	flagNetChurn      = flag.Bool("net-churn", false, "do not reuse connections; every request opens a new one")
+	flagDiskRead      = flag.Int("disk-read", 0, "sustained disk read rate in MB/s; 0 disables")
+	flagDiskWrite     = flag.Int("disk-write", 0, "sustained disk write rate in MB/s; 0 disables")
+	flagDiskReadIOPS  = flag.Int("disk-read-iops", 0, "disk read rate in operations per second; takes precedence over -disk-read")
+	flagDiskWriteIOPS = flag.Int("disk-write-iops", 0, "disk write rate in operations per second; takes precedence over -disk-write")
+	flagDiskSize      = flag.String("disk-size", "512M", "size of the file used for disk load: 512M / 1G / ...; a bare number means GiB")
+	flagDiskBlock     = flag.String("disk-block", "1M", "I/O block size for disk load")
+	flagDiskPattern   = flag.String("disk-pattern", "seq", "access pattern for disk load: seq or rand")
+	flagDiskConns     = flag.Int("disk-conns", 1, "concurrent workers per disk direction")
+	flagDiskDir       = flag.String("disk-dir", "", "directory for the disk file (default the OS temp dir)")
+	flagDiskFsync     = flag.Bool("disk-fsync", false, "fsync after each written pass so the writes are durable")
+	flagDiskDirect    = flag.Bool("disk-direct", false, "open the disk file with O_DIRECT on Linux to bypass the page cache (ignored elsewhere)")
+	flagProcs         = flag.Int("procs", 0, "spawn this many inert child processes")
+	flagThreads       = flag.Int("threads", 0, "hold this many OS threads")
+	flagFds           = flag.Int("fds", 0, "hold this many open file descriptors")
+	flagServe         = flag.String("serve", "", "listen address for the built-in load endpoint, metrics and control, e.g. :8080")
+	flagDuration      = flag.Duration("duration", 0, "stop after this long; 0 runs until signalled")
+	flagCheck         = flag.Bool("check", false, "with -duration, exit non-zero if a measured rate came in under its target")
+	flagReport        = flag.String("report", "", "write a JSON summary of the run to this file on exit")
+	flagConfig        = flag.String("config", "", "JSON file of flag values; command line and environment take precedence")
+	flagLogJSON       = flag.Bool("log-json", false, "write logs as JSON lines")
+	flagVersion       = flag.Bool("version", false, "print the version and exit")
 )
 
+// knobSet is the live load target. Every generator reads it each pass and
+// /control or -profile writes it, so load can change without a restart.
+type knobSet struct {
+	cpuPct    atomic.Int64 // machine percent
+	netDown   atomic.Int64 // bytes per second
+	netUp     atomic.Int64
+	diskRead  atomic.Int64 // bytes per second
+	diskWrite atomic.Int64
+	memBW     atomic.Int64 // bytes per second
+	duty      atomic.Int64 // percent
+	cycleNs   atomic.Int64 // nanoseconds
+}
+
+var knobs knobSet
+
 var (
-	startTime     = time.Now()
+	startTime = time.Now()
+
 	statNetDown   atomic.Int64
 	statNetUp     atomic.Int64
 	statDiskRead  atomic.Int64
 	statDiskWrite atomic.Int64
+	statMemBW     atomic.Int64
 	statServeUp   atomic.Int64
 
-	// Targets reported by /metrics, set in main once the flags are validated.
-	tCPU, tMem, tNetDown, tNetUp, tDiskRead, tDiskWrite int64
+	// Expected byte totals, accumulated once a second from the live knobs, so
+	// -check can compare against a target that moved during the run.
+	expNetDown, expNetUp, expDiskRead, expDiskWrite, expMemBW atomic.Int64
 
-	// Files the disk dimension created, removed on a clean exit.
+	// tMem is the memory actually held, reported by /metrics and -report.
+	tMem int64
+
 	diskCleanup []string
+	fdHold      []*os.File
+	childProcs  []*os.Process
 )
 
 // hold keeps every allocated block reachable so the garbage collector leaves it
 // alone. The kernel reclaims it when the process exits.
 var hold [][]byte
+
+// dutyCycle returns the current duty window: whether load should be running, and
+// how long each cycle is.
+func pulseActive() bool {
+	duty := int(knobs.duty.Load())
+	if duty >= 100 {
+		return true
+	}
+	cycle := time.Duration(knobs.cycleNs.Load())
+	if cycle <= 0 {
+		return true
+	}
+	burn := cycle * time.Duration(duty) / 100
+	if burn <= 0 {
+		burn = time.Millisecond
+	}
+	return time.Since(startTime)%cycle < burn
+}
+
+// accountLoop integrates the live targets once a second into the expected-byte
+// counters. A run under -check is then measured against what it asked for over
+// the whole window, including -duty, -profile and /control changes.
+func accountLoop() {
+	for range time.NewTicker(time.Second).C {
+		f := float64(knobs.duty.Load()) / 100
+		acc := func(k, e *atomic.Int64) {
+			if v := k.Load(); v > 0 && f > 0 {
+				e.Add(int64(float64(v) * f))
+			}
+		}
+		acc(&knobs.netDown, &expNetDown)
+		acc(&knobs.netUp, &expNetUp)
+		acc(&knobs.diskRead, &expDiskRead)
+		acc(&knobs.diskWrite, &expDiskWrite)
+		acc(&knobs.memBW, &expMemBW)
+	}
+}
+
+// checkRates compares what was moved against what was asked for. The bar is
+// deliberately loose: a short run spends its first seconds warming up.
+func checkRates() int {
+	ok := true
+	chk := func(name string, got, exp *atomic.Int64) {
+		e := exp.Load()
+		if e <= 0 {
+			return
+		}
+		g := got.Load()
+		logf("check: %s %.0f%% of target (%s measured, %s expected)",
+			name, float64(g)/float64(e)*100, humanSize(g), humanSize(e))
+		if g < 6*e/10 {
+			ok = false
+		}
+	}
+	chk("net down", &statNetDown, &expNetDown)
+	chk("net up", &statNetUp, &expNetUp)
+	chk("disk read", &statDiskRead, &expDiskRead)
+	chk("disk write", &statDiskWrite, &expDiskWrite)
+	chk("mem bw", &statMemBW, &expMemBW)
+	if ok {
+		return 0
+	}
+	return 1
+}
 
 // cpuPlan works out how many workers to run and how hard each one spins.
 //
@@ -154,87 +258,79 @@ func cpuPlan(pct, cores, perCore int) (workers, duty int, desc string) {
 }
 
 // cpuShape is the CPU plan evaluated over time. Every worker asks it how hard to
-// spin right now, so -duty, -ramp and -schedule share one mechanism instead of
-// starting and stopping workers as the plan changes.
+// spin right now, so -duty, -ramp, -schedule and runtime control share one
+// mechanism instead of starting and stopping workers as the plan changes.
 type cpuShape struct {
 	ncpu, workers int
-	target        int // machine percent, or per-core percent when perCore is set
-	perCore       bool
 	ramp          time.Duration
 	schedule      []int
-	cycle         time.Duration
-	duty          int
 	start         time.Time
 }
 
-// level reports the instantaneous target: machine-wide normally, per-core when
-// perCore is set.
+// level reports the instantaneous target as a machine-wide percentage.
 func (s *cpuShape) level() int {
+	target := int(knobs.cpuPct.Load())
 	el := time.Since(s.start)
+	duty := int(knobs.duty.Load())
+	cycle := time.Duration(knobs.cycleNs.Load())
 	switch {
-	case len(s.schedule) > 0 && s.cycle > 0:
-		slot := s.cycle / time.Duration(len(s.schedule))
+	case len(s.schedule) > 0 && cycle > 0:
+		slot := cycle / time.Duration(len(s.schedule))
 		if slot <= 0 {
 			return s.schedule[0]
 		}
-		return s.schedule[int((el%s.cycle)/slot)]
+		return s.schedule[int((el%cycle)/slot)]
 	case s.ramp > 0 && el < s.ramp:
-		return s.target * int(el) / int(s.ramp)
-	case s.duty < 100:
-		burn := s.cycle * time.Duration(s.duty) / 100
+		return target * int(el) / int(s.ramp)
+	case duty < 100 && cycle > 0:
+		burn := cycle * time.Duration(duty) / 100
 		if burn <= 0 {
 			burn = time.Millisecond
 		}
-		if el%s.cycle >= burn {
+		if el%cycle >= burn {
 			return 0
 		}
 	}
-	return s.target
+	return target
 }
 
-// workerPct turns a level into what a single worker should spin at.
+// workerPct turns a machine-wide level into what a single worker should spin at.
 func (s *cpuShape) workerPct() int {
-	p := s.level()
-	if s.perCore {
-		if p > 100 {
-			p = 100
-		}
-		return p
-	}
-	p = p * s.ncpu / s.workers
+	p := s.level() * s.ncpu / s.workers
 	if p > 100 {
 		p = 100
+	}
+	if p < 0 {
+		p = 0
 	}
 	return p
 }
 
 // startCPU builds the plan and launches one worker per core it wants to load.
-// The workers run for the life of the process; the shape they read decides how
-// hard they spin, so there is no churn when it changes.
+// The workers run for the life of the process; the shape and the knobs decide
+// how hard they spin, so runtime control needs nothing respawned.
 func startCPU(pct, cores, perCore, duty int, cycle, ramp time.Duration, schedule []int) {
 	workers, _, desc := cpuPlan(pct, cores, perCore)
 	target := pct
 	if perCore > 0 {
-		target = perCore
+		// Keep control uniform by working in machine-wide percent throughout.
+		target = perCore * workers / runtime.NumCPU()
 	}
-	s := &cpuShape{
-		ncpu: runtime.NumCPU(), workers: workers, target: target,
-		// A schedule names machine-wide percentages, so it never uses per-core scaling.
-		perCore: perCore > 0 && len(schedule) == 0,
-		ramp:    ramp, schedule: schedule, cycle: cycle, duty: duty, start: time.Now(),
-	}
+	knobs.cpuPct.Store(int64(target))
+	knobs.duty.Store(int64(duty))
+	knobs.cycleNs.Store(int64(cycle))
+
+	s := &cpuShape{ncpu: runtime.NumCPU(), workers: workers, ramp: ramp, schedule: schedule, start: time.Now()}
+	suffix := "continuously"
 	switch {
 	case len(schedule) > 0:
-		logf("cpu: cycling through %s%% of the machine every %s, over %d of %d cores",
-			joinInts(schedule), cycle, workers, s.ncpu)
+		suffix = fmt.Sprintf("cycling through %s%% of the machine every %s", joinInts(schedule), cycle)
 	case ramp > 0:
-		logf("cpu: %s, ramping up over %s", desc, ramp)
+		suffix = "ramping up over " + ramp.String()
 	case duty < 100:
-		burn := cycle * time.Duration(duty) / 100
-		logf("cpu: %s, %s busy every %s (duty %d%%)", desc, burn.Round(time.Second), cycle, duty)
-	default:
-		logf("cpu: %s, continuously", desc)
+		suffix = fmt.Sprintf("%s busy every %s (duty %d%%)", (cycle * time.Duration(duty) / 100).Round(time.Second), cycle, duty)
 	}
+	logf("cpu: %s, %s", desc, suffix)
 	for i := 0; i < workers; i++ {
 		go burnCPU(s)
 	}
@@ -300,6 +396,59 @@ func eatMem(n int64) {
 	}
 }
 
+// memBuilder allocates the bandwidth buffer lazily, on the first time -mem-bw
+// (or a /control or -profile step) asks for a non-zero rate.
+type memBuilder struct {
+	size int64
+	once sync.Once
+	buf  []byte
+}
+
+func (m *memBuilder) buffer() []byte {
+	m.once.Do(func() {
+		m.buf = make([]byte, m.size)
+		rand.Read(m.buf) // touch every page so it is resident
+	})
+	return m.buf
+}
+
+// startMemBW runs a STREAM-like read-modify-write loop over a buffer, paced to
+// the memory-bandwidth target. It is distinct from -mem, which holds pages.
+func startMemBW(size int64) {
+	if size <= 0 {
+		size = 256 * miB
+	}
+	mb := &memBuilder{size: size}
+	lim := newLimiter(1)
+	go func() {
+		const blk = 64 * kiB
+		for {
+			if !pulseActive() {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			bps := knobs.memBW.Load()
+			if bps <= 0 {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			lim.setRate(float64(bps))
+			buf := mb.buffer()
+			for off := 0; off+blk <= len(buf); off += blk {
+				if !pulseActive() {
+					break
+				}
+				lim.wait(blk)
+				seg := buf[off : off+blk]
+				for i := range seg {
+					seg[i] ^= 0x5a // read and write, so it is bandwidth not a no-op
+				}
+				statMemBW.Add(blk)
+			}
+		}
+	}()
+}
+
 // limiter is a byte-rate token bucket. Reads are paced through it so the rate
 // stays near the target continuously, rather than bursting each block out at
 // line speed and sleeping off the difference afterwards. Still stdlib only.
@@ -312,25 +461,40 @@ type limiter struct {
 }
 
 func newLimiter(bytesPerSec float64) *limiter {
-	burst := bytesPerSec / 5 // 200 ms of headroom
-	if burst < 64*kiB {
-		burst = 64 * kiB
-	}
-	if burst > 4*miB {
-		burst = 4 * miB
-	}
-	return &limiter{rate: bytesPerSec, burst: burst, tokens: burst, last: time.Now()}
+	b := burstFor(bytesPerSec)
+	return &limiter{rate: bytesPerSec, burst: b, tokens: b, last: time.Now()}
 }
 
-// wait blocks until n bytes may go out. n is charged at most a full burst so a
-// caller asking for more than the burst cannot wait forever for tokens that
-// will never accumulate.
+// setRate changes the target and rescales the burst with it, so a block sized
+// for a fast rate is still charged correctly after the rate drops.
+func (l *limiter) setRate(bytesPerSec float64) {
+	l.mu.Lock()
+	l.rate = bytesPerSec
+	l.burst = burstFor(bytesPerSec)
+	l.mu.Unlock()
+}
+
+func burstFor(bytesPerSec float64) float64 {
+	b := bytesPerSec / 5 // 200 ms of headroom
+	if b < 64*kiB {
+		b = 64 * kiB
+	}
+	if b > 4*miB {
+		b = 4 * miB
+	}
+	return b
+}
+
+// wait blocks until n bytes may go out. Tokens are capped at one burst so idle
+// time cannot bank an unbounded transfer, but a single read larger than the
+// burst is still charged in full: the cap lifts to the request size so it waits
+// its true duration instead of either racing through or blocking forever.
 func (l *limiter) wait(n int) {
-	want := math.Min(float64(n), l.burst)
+	want := float64(n)
 	for {
 		l.mu.Lock()
 		now := time.Now()
-		l.tokens = math.Min(l.burst, l.tokens+now.Sub(l.last).Seconds()*l.rate)
+		l.tokens = math.Min(math.Max(l.burst, want), l.tokens+now.Sub(l.last).Seconds()*l.rate)
 		l.last = now
 		if l.tokens >= want {
 			l.tokens -= want
@@ -343,25 +507,8 @@ func (l *limiter) wait(n int) {
 	}
 }
 
-// throttled paces a reader through a limiter: every read is charged before the
-// next one is served, which back-pressures the socket via TCP. A nil limiter
-// passes through untouched.
-type throttled struct {
-	r io.Reader
-	l *limiter
-}
-
-func (t *throttled) Read(p []byte) (int, error) {
-	n, err := t.r.Read(p)
-	if n > 0 && t.l != nil {
-		t.l.wait(n)
-	}
-	return n, err
-}
-
 // countingReader adds every byte read to a counter, so throughput shows up while
-// a long transfer is still in flight rather than only when it completes. A
-// streaming source like the built-in /down endpoint never completes.
+// a long transfer is still in flight rather than only when it completes.
 type countingReader struct {
 	r   io.Reader
 	ctr *atomic.Int64
@@ -375,27 +522,63 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// throttled paces a reader through a limiter: every read is charged before the
+// next one is served, which back-pressures the socket via TCP. A nil limiter
+// passes through untouched.
+type throttled struct {
+	r io.Reader
+	l *limiter
+}
+
+func (t *throttled) Read(p []byte) (int, error) {
+	// Honour -duty in the middle of a long transfer: a streaming download never
+	// returns to the worker loop, so the pause has to live in the read path.
+	for !pulseActive() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, err := t.r.Read(p)
+	if n > 0 && t.l != nil {
+		t.l.wait(n)
+	}
+	return n, err
+}
+
 type xferFunc func(client *http.Client, url string, lim *limiter, ctr *atomic.Int64) error
 
-// pushNet drives traffic in one direction, throttled to mbps by a shared limiter
-// and to rps by a per-worker gap. conns workers run in parallel; the byte
-// limiter is shared, so mbps is the total across them.
-func pushNet(dir string, mbps, rps, conns int, url string, ctr *atomic.Int64, xfer xferFunc) {
+// pushNet drives traffic in one direction, reading the target from knob each
+// pass so it can be changed at runtime. conns workers run in parallel and share
+// one limiter, so the target is the total across them.
+func pushNet(dir string, knob *atomic.Int64, rps, conns int, url string, ctr *atomic.Int64, churn bool) {
 	if conns < 1 {
 		conns = 1
 	}
-	var lim *limiter
-	if mbps > 0 {
-		lim = newLimiter(float64(mbps) * 1e6 / 8)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if churn {
+		transport.DisableKeepAlives = true
 	}
+	client := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+	lim := newLimiter(1)
 	var gap time.Duration
 	if rps > 0 {
 		gap = time.Duration(conns) * time.Second / time.Duration(rps)
 	}
-	client := &http.Client{Timeout: 5 * time.Minute}
+	xfer := download
+	if dir == "up" {
+		xfer = upload
+	}
 	for i := 0; i < conns; i++ {
 		go func() {
 			for {
+				if !pulseActive() {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				bps := knob.Load()
+				if bps <= 0 {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				lim.setRate(float64(bps))
 				if err := xfer(client, url, lim, ctr); err != nil {
 					logf("net %s: %v (retrying in 30s)", dir, err)
 					time.Sleep(30 * time.Second)
@@ -407,12 +590,12 @@ func pushNet(dir string, mbps, rps, conns int, url string, ctr *atomic.Int64, xf
 			}
 		}()
 	}
-	go rateReport("net "+dir, "Mbps", ctr, mbps, 8)
+	go rateReport("net "+dir, "Mbps", ctr, knob, 8)
 }
 
 // rateReport logs achieved throughput every five minutes. scale is 8 for bits
-// (to turn bytes into megabits) and 1 for bytes (already MB/s).
-func rateReport(label, unit string, ctr *atomic.Int64, target int, scale float64) {
+// (bytes to megabits) and 1 for bytes (already MB/s).
+func rateReport(label, unit string, ctr, knob *atomic.Int64, scale float64) {
 	last := time.Now()
 	prev := int64(0)
 	for range time.NewTicker(5 * time.Minute).C {
@@ -420,15 +603,16 @@ func rateReport(label, unit string, ctr *atomic.Int64, target int, scale float64
 		el := time.Since(last)
 		logf("%s: %s over the last %s, about %.1f %s (target %d)", label,
 			humanSize(cur-prev), el.Round(time.Second),
-			float64(cur-prev)*scale/el.Seconds()/1e6, unit, target)
+			float64(cur-prev)*scale/el.Seconds()/1e6, unit,
+			int64(float64(knob.Load())*scale/1e6))
 		prev, last = cur, time.Now()
 	}
 }
 
-// download fetches once and returns the byte count. The status check matters:
-// an error page would otherwise count as a successful transfer and the dimension
-// would quietly do nothing (the default endpoint answers 403 with a 1-byte body
-// above 10 MB).
+// download fetches once and returns an error if it did not succeed. The status
+// check matters: an error page would otherwise count as a successful transfer
+// and the dimension would quietly do nothing (the default endpoint answers 403
+// with a 1-byte body above 10 MB).
 func download(client *http.Client, url string, lim *limiter, ctr *atomic.Int64) error {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "staybusy/1.0")
@@ -476,44 +660,159 @@ func upload(client *http.Client, url string, lim *limiter, ctr *atomic.Int64) er
 	return nil
 }
 
-// startDisk prepares and launches the disk dimension.
-func startDisk(readMBs, writeMBs int, size int64, dir string, fsync, direct bool) {
-	if size <= 0 {
+// diskDir is one disk direction. The file is opened lazily, the first time the
+// target goes non-zero, so an idle instance never creates it.
+type diskDir struct {
+	name    string
+	path    string
+	size    int64
+	block   int64
+	pattern string
+	fsync   bool
+	direct  bool
+	write   bool
+	knob    *atomic.Int64
+	ctr     *atomic.Int64
+	lim     *limiter
+	once    sync.Once
+	f       *os.File
+}
+
+func (d *diskDir) open() *os.File {
+	d.once.Do(func() {
+		if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+			logf("disk %s: %v", d.name, err)
+			return
+		}
+		var f *os.File
+		var err error
+		if d.write {
+			if f, err = openDisk(d.path, os.O_RDWR|os.O_CREATE, d.direct); err != nil {
+				logf("disk %s: open: %v", d.name, err)
+				return
+			}
+			if err := f.Truncate(d.size); err != nil {
+				logf("disk %s: truncate: %v", d.name, err)
+			}
+		} else {
+			if err = ensureDiskFile(d.path, d.size, d.block); err != nil {
+				logf("disk %s: %v", d.name, err)
+				return
+			}
+			if f, err = openDisk(d.path, os.O_RDONLY, d.direct); err != nil {
+				logf("disk %s: open: %v", d.name, err)
+				return
+			}
+		}
+		logf("disk %s: about %s/s over a %s file at %s", d.name,
+			humanSize(int64(d.knob.Load())), humanSize(d.size), d.path)
+		d.f = f
+	})
+	return d.f
+}
+
+func (d *diskDir) run(seed int64) {
+	buf := make([]byte, d.block)
+	if d.write {
+		rand.Read(buf)
+	}
+	off := seed
+	ops := int64(0)
+	for {
+		if !pulseActive() {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		bps := d.knob.Load()
+		if bps <= 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		f := d.open()
+		if f == nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		d.lim.setRate(float64(bps))
+		if d.pattern == "rand" {
+			off = rand.Int63n(d.size/d.block) * d.block
+		} else if off+d.block > d.size {
+			off = 0
+		}
+		d.lim.wait(int(d.block))
+		var err error
+		if d.write {
+			_, err = f.WriteAt(buf, off)
+		} else {
+			_, err = f.ReadAt(buf, off)
+		}
+		if err != nil && err != io.EOF {
+			if d.direct {
+				logf("disk %s: %v - retrying without O_DIRECT", d.name, err)
+				f.Close()
+				d.direct = false
+				d.once = sync.Once{}
+				continue
+			}
+			logf("disk %s: %v (retrying in 30s)", d.name, err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		d.ctr.Add(d.block)
+		off += d.block
+		if ops++; d.fsync && ops%(d.size/d.block) == 0 && d.write {
+			f.Sync()
+		}
+	}
+}
+
+// startDisk prepares the disk dimension. Files are created lazily by each
+// direction, so an instance that never asks for disk I/O never touches the disk.
+func startDisk(p *diskParams) {
+	if p.size <= 0 {
 		logf("disk: -disk-size must be positive, skipping")
 		return
 	}
-	if dir == "" {
-		dir = os.TempDir()
+	if p.block <= 0 {
+		p.block = miB
 	}
-	if direct && runtime.GOOS != "linux" {
+	if p.pattern != "rand" {
+		p.pattern = "seq"
+	}
+	if p.direct && runtime.GOOS != "linux" {
 		logf("disk: -disk-direct is Linux-only, ignoring it on %s", runtime.GOOS)
-		direct = false
+		p.direct = false
 	}
-	block := int64(diskBlock)
-	if size < block {
-		block = size
+	if p.block > p.size {
+		p.block = p.size
 	}
-	if rem := size % block; rem != 0 {
-		size += block - rem // keep offsets block-aligned for O_DIRECT
+	if rem := p.size % p.block; rem != 0 {
+		p.size += p.block - rem // keep offsets block-aligned for O_DIRECT
 	}
-	if writeMBs > 0 {
-		path := filepath.Join(dir, "staybusy-write.dat")
-		diskCleanup = append(diskCleanup, path)
-		logf("disk write: about %d MB/s to %s (%s file)", writeMBs, path, humanSize(size))
-		go diskWrite(path, size, block, writeMBs, fsync, direct)
-		go rateReport("disk write", "MB/s", &statDiskWrite, writeMBs, 1)
-	}
-	if readMBs > 0 {
-		path := filepath.Join(dir, "staybusy-read.dat")
-		diskCleanup = append(diskCleanup, path)
-		if err := ensureDiskFile(path, size, block); err != nil {
-			logf("disk: cannot prepare %s: %v", path, err)
-			return
+	for _, dir := range []*diskDir{&p.read, &p.write} {
+		if dir == nil {
+			continue
 		}
-		logf("disk read: about %d MB/s from %s (%s file)", readMBs, path, humanSize(size))
-		go diskRead(path, size, block, readMBs, direct)
-		go rateReport("disk read", "MB/s", &statDiskRead, readMBs, 1)
+		d := dir
+		d.size, d.block, d.pattern, d.fsync, d.direct = p.size, p.block, p.pattern, p.fsync, p.direct
+		if d.name == "" {
+			continue
+		}
+		for i := 0; i < p.conns; i++ {
+			go d.run(int64(i) * d.block)
+		}
+		go rateReport("disk "+d.name, "MB/s", d.ctr, d.knob, 1)
 	}
+}
+
+type diskParams struct {
+	read, write diskDir
+	size        int64
+	block       int64
+	pattern     string
+	conns       int
+	fsync       bool
+	direct      bool
 }
 
 // openDisk opens the disk file, adding O_DIRECT on Linux when asked. If the
@@ -540,6 +839,9 @@ func ensureDiskFile(path string, size, block int64) error {
 	if fi, err := os.Stat(path); err == nil && fi.Size() == size {
 		return nil
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -555,106 +857,104 @@ func ensureDiskFile(path string, size, block int64) error {
 	return f.Sync()
 }
 
-func diskWrite(path string, size, block int64, mbps int, fsync, direct bool) {
-	f, err := openDisk(path, os.O_RDWR|os.O_CREATE, direct)
+// startProcs forks inert copies of ourselves to occupy process slots.
+func startProcs(n int) {
+	exe, err := os.Executable()
 	if err != nil {
-		logf("disk write: open: %v", err)
+		logf("procs: %v", err)
 		return
 	}
-	defer f.Close()
-	if err := f.Truncate(size); err != nil {
-		logf("disk write: truncate: %v", err)
-	}
-	buf := make([]byte, block)
-	rand.Read(buf)
-	lim := newLimiter(float64(mbps) * 1e6)
-	off := int64(0)
-	for {
-		if off >= size {
-			if fsync {
-				f.Sync()
-			}
-			off = 0
+	for i := 0; i < n; i++ {
+		cmd := exec.Command(exe, childToken)
+		cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"} // stay inert
+		if err := cmd.Start(); err != nil {
+			logf("procs: started %d of %d: %v", i, n, err)
+			break
 		}
-		lim.wait(int(block))
-		if _, err := f.WriteAt(buf, off); err != nil {
-			if direct {
-				// Likely O_DIRECT rejected the buffer or the filesystem; drop it.
-				logf("disk write: %v - retrying without O_DIRECT", err)
-				f.Close()
-				if f, err = openDisk(path, os.O_RDWR|os.O_CREATE, false); err != nil {
-					logf("disk write: open: %v", err)
-					return
-				}
-				direct = false
-				continue
-			}
-			logf("disk write: %v (retrying in 30s)", err)
-			time.Sleep(30 * time.Second)
-			continue
-		}
-		statDiskWrite.Add(block)
-		off += block
+		childProcs = append(childProcs, cmd.Process)
 	}
+	logf("procs: spawned %d child processes", len(childProcs))
 }
 
-func diskRead(path string, size, block int64, mbps int, direct bool) {
-	f, err := openDisk(path, os.O_RDONLY, direct)
-	if err != nil {
-		logf("disk read: open: %v", err)
-		return
+func stopProcs() {
+	for _, p := range childProcs {
+		p.Kill()
 	}
-	defer f.Close()
-	buf := make([]byte, block)
-	lim := newLimiter(float64(mbps) * 1e6)
-	off := int64(0)
-	for {
-		if off >= size {
-			off = 0
-		}
-		lim.wait(int(block))
-		if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
-			if direct {
-				logf("disk read: %v - retrying without O_DIRECT", err)
-				f.Close()
-				if f, err = openDisk(path, os.O_RDONLY, false); err != nil {
-					logf("disk read: open: %v", err)
-					return
-				}
-				direct = false
-				continue
-			}
-			logf("disk read: %v (retrying in 30s)", err)
-			time.Sleep(30 * time.Second)
-			continue
-		}
-		statDiskRead.Add(block)
-		off += block
-	}
+	childProcs = nil
 }
 
-// startServe runs the built-in HTTP endpoint: a load target for other staybusy
-// instances, plus health and Prometheus metrics.
+// startThreads holds n OS threads, one locked goroutine each, to occupy thread
+// slots without burning CPU.
+func startThreads(n int) {
+	for i := 0; i < n; i++ {
+		go func() {
+			runtime.LockOSThread()
+			for {
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+	logf("threads: holding %d OS threads", n)
+}
+
+// startFDs opens and holds n file descriptors; it stops early if the limit is
+// reached, which is itself the result worth seeing.
+func startFDs(n int) {
+	for i := 0; i < n; i++ {
+		f, err := os.Open(os.DevNull)
+		if err != nil {
+			logf("fds: opened %d of %d: %v", i, n, err)
+			return
+		}
+		fdHold = append(fdHold, f)
+	}
+	logf("fds: holding %d open file descriptors", len(fdHold))
+}
+
+// startServe runs the built-in HTTP endpoint: a load target and fault injector
+// for other instances, a control plane, health, Prometheus metrics and pprof.
 func startServe(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "staybusy load endpoint\n\n"+
-			"GET  /down[?bytes=N]  random bytes (unbounded without ?bytes)\n"+
-			"POST /up              discard the request body\n"+
-			"GET  /healthz         liveness probe\n"+
-			"GET  /metrics         Prometheus metrics\n")
+		io.WriteString(w, "staybusy endpoint\n\n"+
+			"GET  /down[?bytes=N]   random bytes (unbounded without ?bytes)\n"+
+			"POST /up               discard the request body\n"+
+			"GET  /slow?ms=N        respond after N ms\n"+
+			"GET  /status?code=N    respond with that HTTP status\n"+
+			"GET  /flaky?p=0.1      fail with probability p (code=503)\n"+
+			"GET  /hang             never respond (test client timeouts)\n"+
+			"GET  /control          current load targets (POST to change)\n"+
+			"GET  /healthz          liveness probe\n"+
+			"GET  /metrics          Prometheus metrics\n"+
+			"GET  /debug/pprof/     Go profiles\n")
 	})
 	mux.HandleFunc("/down", serveDown)
 	mux.HandleFunc("/up", serveUp)
+	mux.HandleFunc("/slow", serveSlow)
+	mux.HandleFunc("/status", serveStatus)
+	mux.HandleFunc("/flaky", serveFlaky)
+	mux.HandleFunc("/hang", serveHang)
+	mux.HandleFunc("/control", serveControl)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
 	mux.HandleFunc("/metrics", serveMetrics)
+	servePprof(mux)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil {
 			logf("serve: %v", err)
 		}
 	}()
-	logf("serve: listening on %s (/down, /up, /metrics, /healthz)", addr)
+	logf("serve: listening on %s", addr)
+}
+
+// servePprof mounts the standard Go profilers on our own mux, so nothing is
+// exposed unless -serve is set.
+func servePprof(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 }
 
 func serveDown(w http.ResponseWriter, r *http.Request) {
@@ -691,22 +991,216 @@ func serveUp(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func serveSlow(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(time.Duration(intQuery(r, "ms", 1000)) * time.Millisecond)
+	io.WriteString(w, "ok\n")
+}
+
+func serveStatus(w http.ResponseWriter, r *http.Request) {
+	code := intQuery(r, "code", http.StatusInternalServerError)
+	w.WriteHeader(code)
+	fmt.Fprintf(w, "status %d\n", code)
+}
+
+func serveFlaky(w http.ResponseWriter, r *http.Request) {
+	p := 0.1
+	if v := r.URL.Query().Get("p"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			p = f
+		}
+	}
+	if rand.Float64() < p {
+		code := intQuery(r, "code", http.StatusServiceUnavailable)
+		w.WriteHeader(code)
+		fmt.Fprintf(w, "injected %d\n", code)
+		return
+	}
+	io.WriteString(w, "ok\n")
+}
+
+func serveHang(w http.ResponseWriter, r *http.Request) {
+	<-r.Context().Done()
+}
+
+// serveControl applies the query string to the live knobs (POST) or reports them
+// (GET). Rates are in the same units as the flags: Mbps for net, MB/s for disk
+// and memory bandwidth, percent for cpu and duty.
+func serveControl(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if r.Method != http.MethodPost && r.Method != http.MethodPut || len(q) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(knobState())
+		return
+	}
+	apply := func(name string, k *atomic.Int64, mult int64) bool {
+		v := q.Get(name)
+		if v == "" {
+			return true
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, name+": "+err.Error(), http.StatusBadRequest)
+			return false
+		}
+		k.Store(n * mult)
+		return true
+	}
+	if !apply("cpu", &knobs.cpuPct, 1) ||
+		!apply("duty", &knobs.duty, 1) ||
+		!apply("net-down", &knobs.netDown, 1e6/8) ||
+		!apply("net-up", &knobs.netUp, 1e6/8) ||
+		!apply("disk-read", &knobs.diskRead, 1e6) ||
+		!apply("disk-write", &knobs.diskWrite, 1e6) ||
+		!apply("mem-bw", &knobs.memBW, 1e6) {
+		return
+	}
+	if v := q.Get("cycle"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			http.Error(w, "cycle: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		knobs.cycleNs.Store(int64(d))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(knobState())
+}
+
+func knobState() map[string]any {
+	return map[string]any{
+		"cpu_percent":    knobs.cpuPct.Load(),
+		"net_down_mbps":  float64(knobs.netDown.Load()) * 8 / 1e6,
+		"net_up_mbps":    float64(knobs.netUp.Load()) * 8 / 1e6,
+		"disk_read_mbs":  float64(knobs.diskRead.Load()) / 1e6,
+		"disk_write_mbs": float64(knobs.diskWrite.Load()) / 1e6,
+		"mem_bw_mbs":     float64(knobs.memBW.Load()) / 1e6,
+		"duty":           knobs.duty.Load(),
+		"cycle":          time.Duration(knobs.cycleNs.Load()).String(),
+	}
+}
+
 func serveMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	fmt.Fprintf(w, "# TYPE staybusy_info gauge\nstaybusy_info{version=%q} 1\n", version)
 	metric := func(name string, v int64) { fmt.Fprintf(w, "staybusy_%s %d\n", name, v) }
 	metric("uptime_seconds", int64(time.Since(startTime).Seconds()))
-	metric("cpu_target_percent", tCPU)
+	metric("cpu_target_percent", knobs.cpuPct.Load())
 	metric("mem_target_bytes", tMem)
-	metric("net_down_target_bytes_per_second", tNetDown)
-	metric("net_up_target_bytes_per_second", tNetUp)
-	metric("disk_read_target_bytes_per_second", tDiskRead)
-	metric("disk_write_target_bytes_per_second", tDiskWrite)
+	metric("net_down_target_bytes_per_second", knobs.netDown.Load())
+	metric("net_up_target_bytes_per_second", knobs.netUp.Load())
+	metric("disk_read_target_bytes_per_second", knobs.diskRead.Load())
+	metric("disk_write_target_bytes_per_second", knobs.diskWrite.Load())
+	metric("mem_bw_target_bytes_per_second", knobs.memBW.Load())
+	metric("duty_percent", knobs.duty.Load())
 	metric("net_down_bytes_total", statNetDown.Load())
 	metric("net_up_bytes_total", statNetUp.Load())
 	metric("disk_read_bytes_total", statDiskRead.Load())
 	metric("disk_write_bytes_total", statDiskWrite.Load())
+	metric("mem_bw_bytes_total", statMemBW.Load())
 	metric("serve_up_bytes_total", statServeUp.Load())
+}
+
+func intQuery(r *http.Request, key string, def int) int {
+	if v := r.URL.Query().Get(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// profileStep is one entry of a -profile file. Absent fields are left unchanged.
+type profileStep struct {
+	Duration  *string `json:"duration"`
+	CPU       *int    `json:"cpu"`
+	NetDown   *int    `json:"net-down"`
+	NetUp     *int    `json:"net-up"`
+	DiskRead  *int    `json:"disk-read"`
+	DiskWrite *int    `json:"disk-write"`
+	MemBW     *int    `json:"mem-bw"`
+	Duty      *int    `json:"duty"`
+	Cycle     *string `json:"cycle"`
+}
+
+func loadProfile(path string) ([]profileStep, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var steps []profileStep
+	if err := json.Unmarshal(b, &steps); err != nil {
+		return nil, err
+	}
+	return steps, nil
+}
+
+func applyStep(s profileStep) {
+	set := func(p *int, k *atomic.Int64, mult int64) {
+		if p != nil {
+			k.Store(int64(*p) * mult)
+		}
+	}
+	set(s.CPU, &knobs.cpuPct, 1)
+	set(s.NetDown, &knobs.netDown, 1e6/8)
+	set(s.NetUp, &knobs.netUp, 1e6/8)
+	set(s.DiskRead, &knobs.diskRead, 1e6)
+	set(s.DiskWrite, &knobs.diskWrite, 1e6)
+	set(s.MemBW, &knobs.memBW, 1e6)
+	set(s.Duty, &knobs.duty, 1)
+	if s.Cycle != nil {
+		if d, err := time.ParseDuration(*s.Cycle); err == nil {
+			knobs.cycleNs.Store(int64(d))
+		}
+	}
+}
+
+func runProfile(steps []profileStep) {
+	go func() {
+		for i, st := range steps {
+			applyStep(st)
+			logf("profile: step %d/%d cpu=%d net-down=%d net-up=%d", i+1, len(steps),
+				knobs.cpuPct.Load(), int64(float64(knobs.netDown.Load())*8/1e6), int64(float64(knobs.netUp.Load())*8/1e6))
+			if st.Duration == nil {
+				return
+			}
+			d, err := time.ParseDuration(*st.Duration)
+			if err != nil {
+				logf("profile: bad duration %q", *st.Duration)
+				return
+			}
+			time.Sleep(d)
+		}
+	}()
+}
+
+// writeReport dumps the achieved versus expected totals as JSON.
+func writeReport(path string) {
+	el := time.Since(startTime).Seconds()
+	if el <= 0 {
+		el = 1
+	}
+	type dim struct {
+		TargetBytesPerSecond int64   `json:"target_bytes_per_second"`
+		Bytes                int64   `json:"bytes_total"`
+		MeasuredBytesPerSec  float64 `json:"measured_bytes_per_second"`
+	}
+	r := map[string]any{
+		"version":            version,
+		"uptime_seconds":     el,
+		"cpu_target_percent": knobs.cpuPct.Load(),
+		"mem_target_bytes":   tMem,
+		"net_down":           dim{knobs.netDown.Load(), statNetDown.Load(), float64(statNetDown.Load()) / el},
+		"net_up":             dim{knobs.netUp.Load(), statNetUp.Load(), float64(statNetUp.Load()) / el},
+		"disk_read":          dim{knobs.diskRead.Load(), statDiskRead.Load(), float64(statDiskRead.Load()) / el},
+		"disk_write":         dim{knobs.diskWrite.Load(), statDiskWrite.Load(), float64(statDiskWrite.Load()) / el},
+		"mem_bw":             dim{knobs.memBW.Load(), statMemBW.Load(), float64(statMemBW.Load()) / el},
+	}
+	b, _ := json.MarshalIndent(r, "", "  ")
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		logf("report: %v", err)
+		return
+	}
+	logf("report: wrote %s", path)
 }
 
 // parseSize reads "512M" / "1.5G" / "1024K". A bare number means GiB.
@@ -957,53 +1451,32 @@ func configValue(v any) string {
 	}
 }
 
-// checkRates compares what was actually moved against the targets and returns a
-// non-zero exit code if any of them came in well under. The bar is deliberately
-// loose: a short run spends its first seconds warming up, so a steady rate is
-// below target across the whole window. CPU and memory are not checked, since
-// they are held rather than measured.
-func checkRates(el time.Duration) int {
-	if el <= 0 {
-		el = time.Second
+func diskRate(mbs, iops int, block int64) int64 {
+	if iops > 0 && block > 0 {
+		return int64(iops) * block
 	}
-	ok := true
-	mbps := func(v int64) float64 { return float64(v) * 8 / el.Seconds() / 1e6 }
-	mbs := func(v int64) float64 { return float64(v) / el.Seconds() / 1e6 }
-	if *flagNetDown > 0 {
-		got := mbps(statNetDown.Load())
-		logf("check: net down %.1f Mbps measured, target %d", got, *flagNetDown)
-		ok = ok && got >= 0.6*float64(*flagNetDown)
-	}
-	if *flagNetUp > 0 {
-		got := mbps(statNetUp.Load())
-		logf("check: net up %.1f Mbps measured, target %d", got, *flagNetUp)
-		ok = ok && got >= 0.6*float64(*flagNetUp)
-	}
-	if *flagDiskRead > 0 {
-		got := mbs(statDiskRead.Load())
-		logf("check: disk read %.1f MB/s measured, target %d", got, *flagDiskRead)
-		ok = ok && got >= 0.6*float64(*flagDiskRead)
-	}
-	if *flagDiskWrite > 0 {
-		got := mbs(statDiskWrite.Load())
-		logf("check: disk write %.1f MB/s measured, target %d", got, *flagDiskWrite)
-		ok = ok && got >= 0.6*float64(*flagDiskWrite)
-	}
-	if ok {
-		return 0
-	}
-	return 1
+	return int64(mbs) * 1e6
 }
 
 func cleanup() {
+	stopProcs()
+	for _, f := range fdHold {
+		f.Close()
+	}
 	for _, p := range diskCleanup {
 		os.Remove(p)
 	}
 }
 
 func main() {
-	flag.Parse()
+	// An inert child for -procs: no flags, no work, just hold a process slot.
+	if len(os.Args) > 1 && os.Args[1] == childToken {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 
+	flag.Parse()
 	if *flagVersion {
 		fmt.Println("staybusy " + version)
 		return
@@ -1020,12 +1493,25 @@ func main() {
 		fmt.Println("-disk-size:", err)
 		os.Exit(2)
 	}
+	diskBlock, err := parseSize(*flagDiskBlock)
+	if err != nil {
+		fmt.Println("-disk-block:", err)
+		os.Exit(2)
+	}
+	memBWSize, err := parseSize(*flagMemBWSize)
+	if err != nil {
+		fmt.Println("-mem-bw-size:", err)
+		os.Exit(2)
+	}
 	schedule, err := parseSchedule(*flagSchedule)
 	if err != nil {
 		fmt.Println("-schedule:", err)
 		os.Exit(2)
 	}
-
+	if *flagDiskPattern != "seq" && *flagDiskPattern != "rand" {
+		fmt.Println("-disk-pattern must be seq or rand")
+		os.Exit(2)
+	}
 	for _, c := range []struct {
 		bad bool
 		msg string
@@ -1040,6 +1526,10 @@ func main() {
 		{*flagNetConns < 1, "-net-conns must be at least 1"},
 		{*flagNetRPS < 0, "-net-rps must not be negative"},
 		{*flagDiskRead < 0 || *flagDiskWrite < 0, "-disk-read and -disk-write must not be negative"},
+		{*flagDiskReadIOPS < 0 || *flagDiskWriteIOPS < 0, "-disk-read-iops and -disk-write-iops must not be negative"},
+		{*flagDiskConns < 1, "-disk-conns must be at least 1"},
+		{*flagMemBW < 0, "-mem-bw must not be negative"},
+		{*flagProcs < 0 || *flagThreads < 0 || *flagFds < 0, "-procs, -threads and -fds must not be negative"},
 		{*flagDuration < 0, "-duration must not be negative"},
 	} {
 		if c.bad {
@@ -1051,26 +1541,42 @@ func main() {
 	cpuOn := *flagCPU > 0 || *flagPerCore > 0 || len(schedule) > 0
 	netDownOn := *flagNetDown > 0
 	netUpOn := *flagNetUp > 0
-	diskOn := *flagDiskRead > 0 || *flagDiskWrite > 0
+	diskReadOn := *flagDiskRead > 0 || *flagDiskReadIOPS > 0
+	diskWriteOn := *flagDiskWrite > 0 || *flagDiskWriteIOPS > 0
+	memBWOn := *flagMemBW > 0
+	dynamic := *flagServe != "" || *flagProfile != ""
+	procOn := *flagProcs > 0 || *flagThreads > 0 || *flagFds > 0
 
-	if !cpuOn && mem == 0 && !netDownOn && !netUpOn && !diskOn && *flagServe == "" {
+	if !cpuOn && mem == 0 && !netDownOn && !netUpOn && !diskReadOn && !diskWriteOn &&
+		!memBWOn && !procOn && !dynamic {
 		fmt.Print("staybusy - put a controlled load on a machine\n\n")
 		flag.PrintDefaults()
 		return
 	}
 
-	tCPU = int64(*flagCPU)
-	tNetDown = int64(*flagNetDown) * 1e6 / 8
-	tNetUp = int64(*flagNetUp) * 1e6 / 8
-	tDiskRead = int64(*flagDiskRead) * 1e6
-	tDiskWrite = int64(*flagDiskWrite) * 1e6
+	var steps []profileStep
+	if *flagProfile != "" {
+		if steps, err = loadProfile(*flagProfile); err != nil {
+			fmt.Println("-profile:", err)
+			os.Exit(2)
+		}
+	}
 
-	if cpuOn {
+	// Seed the live knobs from the flags; the generators read these.
+	knobs.netDown.Store(int64(*flagNetDown) * 1e6 / 8)
+	knobs.netUp.Store(int64(*flagNetUp) * 1e6 / 8)
+	knobs.diskRead.Store(diskRate(*flagDiskRead, *flagDiskReadIOPS, diskBlock))
+	knobs.diskWrite.Store(diskRate(*flagDiskWrite, *flagDiskWriteIOPS, diskBlock))
+	knobs.memBW.Store(int64(*flagMemBW) * 1e6)
+	knobs.duty.Store(int64(*flagDuty))
+	knobs.cycleNs.Store(int64(*flagCycle))
+
+	go accountLoop()
+
+	if cpuOn || dynamic {
 		startCPU(*flagCPU, *flagCores, *flagPerCore, *flagDuty, *flagCycle, *flagRamp, schedule)
 	}
 	if mem > 0 {
-		// Clamp rather than warn: a warning followed by the allocation anyway
-		// is no protection at all.
 		reserve := reserveFor()
 		if avail := availBytes(); avail > 0 {
 			safe := avail - reserve
@@ -1095,21 +1601,52 @@ func main() {
 		}
 	}
 	tMem = mem
-	if netDownOn {
-		logf("net down: about %d Mbps (%.2f TB/day) from %s", *flagNetDown,
-			float64(*flagNetDown)*86400/8/1e6, *flagNetDownURL)
-		pushNet("down", *flagNetDown, *flagNetRPS, *flagNetConns, *flagNetDownURL, &statNetDown, download)
+	if netDownOn || dynamic {
+		if netDownOn {
+			logf("net down: about %d Mbps (%.2f TB/day) from %s", *flagNetDown,
+				float64(*flagNetDown)*86400/8/1e6, *flagNetDownURL)
+		}
+		pushNet("down", &knobs.netDown, *flagNetRPS, *flagNetConns, *flagNetDownURL, &statNetDown, *flagNetChurn)
 	}
-	if netUpOn {
-		logf("net up: about %d Mbps (%.2f TB/day) to %s", *flagNetUp,
-			float64(*flagNetUp)*86400/8/1e6, *flagNetUpURL)
-		pushNet("up", *flagNetUp, *flagNetRPS, *flagNetConns, *flagNetUpURL, &statNetUp, upload)
+	if netUpOn || dynamic {
+		if netUpOn {
+			logf("net up: about %d Mbps (%.2f TB/day) to %s", *flagNetUp,
+				float64(*flagNetUp)*86400/8/1e6, *flagNetUpURL)
+		}
+		pushNet("up", &knobs.netUp, *flagNetRPS, *flagNetConns, *flagNetUpURL, &statNetUp, *flagNetChurn)
 	}
-	if diskOn {
-		startDisk(*flagDiskRead, *flagDiskWrite, diskSize, *flagDiskDir, *flagDiskFsync, *flagDiskDirect)
+	if memBWOn || dynamic {
+		startMemBW(memBWSize)
+	}
+	if diskReadOn || diskWriteOn || dynamic {
+		p := diskParams{size: diskSize, block: diskBlock, pattern: *flagDiskPattern,
+			conns: *flagDiskConns, fsync: *flagDiskFsync, direct: *flagDiskDirect}
+		if diskReadOn || dynamic {
+			p.read = diskDir{name: "read", path: filepath.Join(tmpDir(), "staybusy-read.dat"),
+				knob: &knobs.diskRead, ctr: &statDiskRead, lim: newLimiter(1)}
+			diskCleanup = append(diskCleanup, p.read.path)
+		}
+		if diskWriteOn || dynamic {
+			p.write = diskDir{name: "write", path: filepath.Join(tmpDir(), "staybusy-write.dat"),
+				knob: &knobs.diskWrite, ctr: &statDiskWrite, lim: newLimiter(1)}
+			diskCleanup = append(diskCleanup, p.write.path)
+		}
+		startDisk(&p)
+	}
+	if *flagProcs > 0 {
+		startProcs(*flagProcs)
+	}
+	if *flagThreads > 0 {
+		startThreads(*flagThreads)
+	}
+	if *flagFds > 0 {
+		startFDs(*flagFds)
 	}
 	if *flagServe != "" {
 		startServe(*flagServe)
+	}
+	if len(steps) > 0 {
+		runProfile(steps)
 	}
 
 	// Not a bare `select {}`: with only -mem set, the allocating goroutine
@@ -1131,12 +1668,22 @@ func main() {
 	case <-duration:
 		logf("duration %s reached, exiting", flagDuration.Round(time.Second))
 		if *flagCheck {
-			exitCode = checkRates(time.Since(startTime))
+			exitCode = checkRates()
 		}
 	case <-time.After(24 * time.Hour):
+	}
+	if *flagReport != "" {
+		writeReport(*flagReport)
 	}
 	cleanup()
 	if exitCode != 0 {
 		os.Exit(exitCode)
 	}
+}
+
+func tmpDir() string {
+	if *flagDiskDir != "" {
+		return *flagDiskDir
+	}
+	return os.TempDir()
 }

@@ -11,20 +11,22 @@ The image's `CMD` is `-cpu 25`, so with no arguments it holds 25% of the machine
 CPU. The bare binary defaults `-cpu` to `0` and just prints help — **the 25% comes
 from the image, not from the program.**
 
-Four resources, each off by default and independently controllable:
+Everything is off by default and independently controllable:
 
 | resource | what it does |
 |---|---|
-| CPU | duty-cycled busy loop, continuous, pulsed, ramped or scheduled |
-| memory | anonymous pages, allocated and written so they are really resident |
+| CPU | duty-cycled busy loop: continuous, pulsed, ramped or scheduled |
+| memory | anonymous pages held resident, or a sustained `-mem-bw` stream |
 | network | sustained transfers, either direction or both at once |
-| disk | sustained reads and/or writes, throttled to a target rate |
+| disk | sustained reads and/or writes, by throughput or IOPS |
+| process | `-procs` children, `-threads` OS threads, `-fds` open handles |
 
 Handy for exercising autoscaling rules, validating monitoring thresholds and
-alerts, reproducing resource contention, and smoke-testing capacity limits. It
-can also run for a fixed time (`-duration`), serve load to another instance and
-expose Prometheus metrics (`-serve`), and be configured from the environment or
-a file.
+alerts, reproducing resource contention, and smoke-testing capacity limits. The
+load can change at runtime over HTTP (`-serve` exposes `/control`), follow a
+scripted timeline (`-profile`), run for a fixed time (`-duration`), serve as its
+own load target and fault injector, expose Prometheus metrics, and be configured
+from the environment or a file.
 
 ---
 
@@ -39,22 +41,35 @@ a file.
 | `-cycle` | `1h` | length of one duty cycle (when `-duty < 100`) or of one `-schedule` pass |
 | `-ramp` | `0` (off) | ramp CPU from 0 up to its target over this period at startup |
 | `-schedule` | (off) | comma-separated CPU percentages to cycle through, e.g. `80,20,0` |
+| `-profile` | (off) | JSON file of timed steps that change the load over time |
 | `-mem` | `0` (off) | memory to hold: `512M` / `1.5G` / `1024K`; a bare number means GiB |
+| `-mem-bw` | `0` (off) | sustained memory bandwidth in MB/s |
+| `-mem-bw-size` | `256M` | buffer size for `-mem-bw` |
 | `-net-down` | `0` (off) | sustained download rate in Mbps |
 | `-net-up` | `0` (off) | sustained upload rate in Mbps; runs alongside `-net-down` |
 | `-net-down-url` | Cloudflare | download source |
 | `-net-up-url` | Cloudflare | upload target |
 | `-net-conns` | `1` | concurrent connections per direction |
 | `-net-rps` | `0` (off) | requests per second per direction, on top of the byte rate |
+| `-net-churn` | off | do not reuse connections; every request opens a new one |
 | `-disk-read` | `0` (off) | sustained disk read rate in MB/s |
 | `-disk-write` | `0` (off) | sustained disk write rate in MB/s |
+| `-disk-read-iops` | `0` (off) | disk read rate in ops/s; takes precedence over `-disk-read` |
+| `-disk-write-iops` | `0` (off) | disk write rate in ops/s; takes precedence over `-disk-write` |
 | `-disk-size` | `512M` | size of the file used for disk load |
+| `-disk-block` | `1M` | I/O block size for disk load |
+| `-disk-pattern` | `seq` | disk access pattern: `seq` or `rand` |
+| `-disk-conns` | `1` | concurrent workers per disk direction |
 | `-disk-dir` | temp dir | directory for the disk file |
 | `-disk-fsync` | off | fsync after each written pass so writes are durable |
 | `-disk-direct` | off | `O_DIRECT` on Linux to bypass the page cache (ignored elsewhere) |
-| `-serve` | (off) | listen address for the built-in load endpoint and metrics, e.g. `:8080` |
+| `-procs` | `0` (off) | spawn this many inert child processes |
+| `-threads` | `0` (off) | hold this many OS threads |
+| `-fds` | `0` (off) | hold this many open file descriptors |
+| `-serve` | (off) | listen address for the load endpoint, metrics and control, e.g. `:8080` |
 | `-duration` | `0` (forever) | stop after this long |
 | `-check` | off | with `-duration`, exit non-zero if a measured rate came in under target |
+| `-report` | (off) | write a JSON summary of the run to this file on exit |
 | `-config` | (off) | JSON file of flag values (command line and environment win) |
 | `-log-json` | off | write logs as JSON lines |
 | `-version` | | print the version and exit |
@@ -173,9 +188,11 @@ The upload buffer (8 MiB) is allocated on first use, so a run without `-net-up`
 does not carry it.
 
 `-net-conns` opens several connections at once; the byte rate is the total across
-them. `-net-rps` adds a request-rate cap on top. For a self-contained pair, run
-one instance with `-serve` and point another at it (see below) so no external
-endpoint is involved.
+them. `-net-rps` adds a request-rate cap on top. `-net-churn` disables connection
+reuse, so every request opens a fresh TCP connection — pair it with `-net-rps` and
+a small response to stress accept queues and conntrack rather than bandwidth. For
+a self-contained pair, run one instance with `-serve` and point another at it (see
+below) so no external endpoint is involved.
 
 ## Disk
 
@@ -204,6 +221,39 @@ and falls back silently if the filesystem rejects `O_DIRECT`. Without it the
 page cache will absorb much of a read, so for a read test that actually hits the
 disk either use `-disk-direct` or a file larger than RAM.
 
+For IOPS rather than throughput, set the rate in operations per second and choose
+a block size — the two compose (`-disk-write-iops 5000 -disk-block 4K` is 5000
+writes/s of 4 KiB). `-disk-pattern rand` picks a random block each time instead of
+walking the file, and `-disk-conns N` runs N workers per direction:
+
+```bash
+staybusy -disk-read-iops 20000 -disk-block 4K -disk-pattern rand -disk-conns 4
+```
+
+## Memory bandwidth
+
+`-mem` holds pages; `-mem-bw` exercises the memory *controller*. It allocates a
+`-mem-bw-size` buffer and runs a read-modify-write loop over it, paced to the
+target, which shows up as memory bandwidth rather than resident set:
+
+```bash
+staybusy -mem-bw 2000 -mem-bw-size 512M       # 2 GB/s of stream traffic
+```
+
+## Processes, threads and file descriptors
+
+Three knobs that test limits rather than throughput:
+
+```bash
+staybusy -procs 500      # 500 inert child processes (PID table, fork handling)
+staybusy -threads 200    # hold 200 OS threads
+staybusy -fds 5000       # open and hold 5000 descriptors (RLIMIT_NOFILE)
+```
+
+`-procs` re-executes the binary as an inert child per process and kills them on
+exit; `-fds` stops early and logs the count if the descriptor limit is hit, which
+is the number worth seeing.
+
 ## Serve and metrics
 
 `-serve :8080` turns the instance into a load target and a metrics endpoint,
@@ -213,8 +263,14 @@ sharing one listener:
 |---|---|
 | `GET /down[?bytes=N]` | streams random bytes (unbounded without `?bytes`) |
 | `POST /up` | discards the request body |
+| `GET /slow?ms=N` | respond after N ms |
+| `GET /status?code=N` | respond with that HTTP status |
+| `GET /flaky?p=0.1` | fail with probability p (`code=503`) |
+| `GET /hang` | never respond, to test client timeouts |
+| `GET /control` | current load targets (`POST` to change them) |
 | `GET /healthz` | `ok` |
 | `GET /metrics` | Prometheus text: targets, throughput counters, uptime |
+| `GET /debug/pprof/` | Go profiles |
 
 That makes a self-contained pair — no external endpoint, no 10 MB gotcha:
 
@@ -222,6 +278,34 @@ That makes a self-contained pair — no external endpoint, no 10 MB gotcha:
 staybusy -serve :8080 &                                  # the target
 staybusy -net-down 200 -net-down-url http://host:8080/down
 staybusy -net-up 50   -net-up-url   http://host:8080/up
+```
+
+The fault endpoints (`/slow`, `/status`, `/flaky`, `/hang`) are for testing
+timeouts, retries, circuit breakers and load-balancer eviction against a target
+you control.
+
+## Runtime control and profiles
+
+With `-serve`, `POST /control` changes the live targets without a restart. Rates
+use the flag units — Mbps for net, MB/s for disk and memory bandwidth, percent for
+CPU and duty:
+
+```bash
+curl -X POST 'http://host:8080/control?cpu=80&net-down=100&duty=10&cycle=5m'
+curl http://host:8080/control            # GET reports the current targets
+```
+
+CPU, network, disk and memory-bandwidth workers are always present under
+`-serve`, so any of them can be turned on from zero. `-profile` scripts the same
+knobs over time from a JSON file of steps — each step is held for its `duration`,
+absent fields are left unchanged, and the last state is held at the end:
+
+```json
+[
+  { "duration": "2m", "cpu": 20, "net-down": 10 },
+  { "duration": "5m", "cpu": 80, "net-down": 200 },
+  { "cpu": 0,  "net-down": 0 }
+]
 ```
 
 ## Duration, exit code and logging
@@ -235,9 +319,15 @@ assert on the exit code:
 staybusy -net-down 100 -duration 60s -check    # exit 1 if it never got near 100 Mbps
 ```
 
-The bar is deliberately loose — a short run spends its first seconds warming up
-— so treat `-check` as a coarse smoke test, not a measurement. `-log-json` emits
-one JSON object per line (`{"time":...,"msg":...}`) instead of timestamped text.
+`-check` compares against the target *over the whole run*, accounting for `-duty`,
+`-profile` and any `/control` changes, so a ramped or pulsed run is measured
+against what it actually asked for. The bar is deliberately loose — a short run
+spends its first seconds warming up — so treat `-check` as a coarse smoke test,
+not a measurement.
+
+`-report results.json` writes the achieved-versus-expected totals for every
+dimension on exit, for CI artifacts. `-log-json` emits one JSON object per line
+(`{"time":...,"msg":...}`) instead of timestamped text.
 
 ## Configuration
 
@@ -307,9 +397,15 @@ Each of these cost a debugging session:
   reports as a deadlock and panics on. A pending timer keeps the process off that
   path, and the same select turns SIGTERM — what `docker stop` sends — into a
   clean exit.
-- **A byte-rate bucket must cap what it charges.** Charging a read larger than the
-  bucket would wait for tokens that can never accrue and hang the transfer, so the
-  charge is capped at one bucketful.
+- **A byte-rate bucket has to rescale its burst with its rate.** The bucket was
+  built once from the initial rate and only its rate changed later, so a disk block
+  larger than the stale burst was charged a fraction of its size and a 20 MB/s read
+  ran at 250 MB/s. The burst is now recomputed whenever the rate is set, and a read
+  larger than the burst lifts the cap to its own size so it waits its true duration
+  instead of racing through or blocking forever.
+- **A duty cycle has to be enforced inside a streaming read.** A long `/down`
+  transfer never returns to the worker loop, so `-duty` did nothing for network
+  load. The pause lives in the throttled reader now.
 - **A fixed memory reserve is wrong inside a container.** 512 MiB is a sane
   cushion on a host and half of a 1 GiB cgroup, so the reserve scales to a quarter
   of the budget.
