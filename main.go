@@ -133,6 +133,10 @@ var (
 	statMemBW     atomic.Int64
 	statServeUp   atomic.Int64
 
+	// heldBytes is memory this process has already committed (-mem plus a
+	// -mem-bw buffer), so a second allocation is measured against what is left.
+	heldBytes atomic.Int64
+
 	// Expected byte totals, accumulated once a second from the live knobs, so
 	// -check can compare against a target that moved during the run.
 	expNetDown, expNetUp, expDiskRead, expDiskWrite, expMemBW atomic.Int64
@@ -141,6 +145,7 @@ var (
 	tMem int64
 
 	diskCleanup []string
+	diskFiles   []*os.File
 	fdHold      []*os.File
 	childProcs  []*os.Process
 )
@@ -167,15 +172,21 @@ func pulseActive() bool {
 	return time.Since(startTime)%cycle < burn
 }
 
-// accountLoop integrates the live targets once a second into the expected-byte
-// counters. A run under -check is then measured against what it asked for over
-// the whole window, including -duty, -profile and /control changes.
+// accountLoop integrates the live targets into the expected-byte counters.
+//
+// It samples whether the duty window is open right now rather than scaling by
+// the duty fraction: -duty is a square wave (busy for the first duty% of each
+// cycle), so a short run can sit entirely inside the busy leg. Sampling at 100ms
+// tracks that, where a duty-scaled average would be off by the whole cycle.
 func accountLoop() {
-	for range time.NewTicker(time.Second).C {
-		f := float64(knobs.duty.Load()) / 100
+	const dt = 100 * time.Millisecond
+	for range time.NewTicker(dt).C {
+		if !pulseActive() {
+			continue
+		}
 		acc := func(k, e *atomic.Int64) {
-			if v := k.Load(); v > 0 && f > 0 {
-				e.Add(int64(float64(v) * f))
+			if v := k.Load(); v > 0 {
+				e.Add(int64(float64(v) * dt.Seconds()))
 			}
 		}
 		acc(&knobs.netDown, &expNetDown)
@@ -263,23 +274,48 @@ func cpuPlan(pct, cores, perCore int) (workers, duty int, desc string) {
 type cpuShape struct {
 	ncpu, workers int
 	ramp          time.Duration
-	schedule      []int
 	start         time.Time
+
+	mu       sync.Mutex
+	schedule []int
+}
+
+func (s *cpuShape) setSchedule(v []int) {
+	s.mu.Lock()
+	s.schedule = v
+	s.mu.Unlock()
+}
+
+func (s *cpuShape) currentSchedule() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.schedule
+}
+
+// activeCPU is the running shape, so an explicit CPU target (from /control or a
+// -profile step) can cancel a schedule that would otherwise ignore it.
+var activeCPU *cpuShape
+
+func clearSchedule() {
+	if activeCPU != nil {
+		activeCPU.setSchedule(nil)
+	}
 }
 
 // level reports the instantaneous target as a machine-wide percentage.
 func (s *cpuShape) level() int {
 	target := int(knobs.cpuPct.Load())
+	schedule := s.currentSchedule()
 	el := time.Since(s.start)
 	duty := int(knobs.duty.Load())
 	cycle := time.Duration(knobs.cycleNs.Load())
 	switch {
-	case len(s.schedule) > 0 && cycle > 0:
-		slot := cycle / time.Duration(len(s.schedule))
+	case len(schedule) > 0 && cycle > 0:
+		slot := cycle / time.Duration(len(schedule))
 		if slot <= 0 {
-			return s.schedule[0]
+			return schedule[0]
 		}
-		return s.schedule[int((el%cycle)/slot)]
+		return schedule[int((el%cycle)/slot)]
 	case s.ramp > 0 && el < s.ramp:
 		return target * int(el) / int(s.ramp)
 	case duty < 100 && cycle > 0:
@@ -321,6 +357,7 @@ func startCPU(pct, cores, perCore, duty int, cycle, ramp time.Duration, schedule
 	knobs.cycleNs.Store(int64(cycle))
 
 	s := &cpuShape{ncpu: runtime.NumCPU(), workers: workers, ramp: ramp, schedule: schedule, start: time.Now()}
+	activeCPU = s
 	suffix := "continuously"
 	switch {
 	case len(schedule) > 0:
@@ -392,12 +429,14 @@ func eatMem(n int64) {
 		b := make([]byte, size)
 		rand.Read(b) // random data also defeats hypervisor page dedup
 		hold = append(hold, b)
+		heldBytes.Add(size)
 		n -= size
 	}
 }
 
-// memBuilder allocates the bandwidth buffer lazily, on the first time -mem-bw
-// (or a /control or -profile step) asks for a non-zero rate.
+// memBuilder allocates the bandwidth buffer lazily, the first time -mem-bw (or a
+// /control or -profile step) asks for a non-zero rate. The allocation is clamped
+// through the same budget as -mem, so it cannot walk a small cgroup into an OOM.
 type memBuilder struct {
 	size int64
 	once sync.Once
@@ -406,18 +445,21 @@ type memBuilder struct {
 
 func (m *memBuilder) buffer() []byte {
 	m.once.Do(func() {
-		m.buf = make([]byte, m.size)
+		size := memAllowance(m.size, "mem-bw", heldBytes.Load())
+		if size <= 0 {
+			return
+		}
+		m.buf = make([]byte, size)
 		rand.Read(m.buf) // touch every page so it is resident
+		heldBytes.Add(size)
 	})
 	return m.buf
 }
 
 // startMemBW runs a STREAM-like read-modify-write loop over a buffer, paced to
 // the memory-bandwidth target. It is distinct from -mem, which holds pages.
+// A size of 0 means the budget could not fit it, so the loop stays idle.
 func startMemBW(size int64) {
-	if size <= 0 {
-		size = 256 * miB
-	}
 	mb := &memBuilder{size: size}
 	lim := newLimiter(1)
 	go func() {
@@ -434,6 +476,10 @@ func startMemBW(size int64) {
 			}
 			lim.setRate(float64(bps))
 			buf := mb.buffer()
+			if len(buf) == 0 {
+				time.Sleep(time.Second)
+				continue
+			}
 			for off := 0; off+blk <= len(buf); off += blk {
 				if !pulseActive() {
 					break
@@ -661,7 +707,9 @@ func upload(client *http.Client, url string, lim *limiter, ctr *atomic.Int64) er
 }
 
 // diskDir is one disk direction. The file is opened lazily, the first time the
-// target goes non-zero, so an idle instance never creates it.
+// target goes non-zero, so an idle instance never creates it. All file state is
+// behind mu: with -disk-conns > 1 several workers share the one handle, and a
+// direct-IO failure has to swap the handle for a plain one without racing.
 type diskDir struct {
 	name    string
 	path    string
@@ -669,46 +717,71 @@ type diskDir struct {
 	block   int64
 	pattern string
 	fsync   bool
-	direct  bool
 	write   bool
 	knob    *atomic.Int64
 	ctr     *atomic.Int64
 	lim     *limiter
-	once    sync.Once
-	f       *os.File
+
+	mu     sync.Mutex
+	direct bool
+	opened bool
+	f      *os.File
 }
 
-func (d *diskDir) open() *os.File {
-	d.once.Do(func() {
-		if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+// file returns the shared handle, opening it on first use. The bool reports
+// whether it was opened with O_DIRECT, so the caller knows if a failure is worth
+// retrying without it.
+func (d *diskDir) file() (*os.File, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.opened {
+		return d.f, d.direct
+	}
+	d.opened = true
+	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+		logf("disk %s: %v", d.name, err)
+		return nil, d.direct
+	}
+	var f *os.File
+	var err error
+	if d.write {
+		if f, err = openDisk(d.path, os.O_RDWR|os.O_CREATE, d.direct); err != nil {
+			logf("disk %s: open: %v", d.name, err)
+			return nil, d.direct
+		}
+		if err := f.Truncate(d.size); err != nil {
+			logf("disk %s: truncate: %v", d.name, err)
+		}
+	} else {
+		if err = ensureDiskFile(d.path, d.size, d.block); err != nil {
 			logf("disk %s: %v", d.name, err)
-			return
+			return nil, d.direct
 		}
-		var f *os.File
-		var err error
-		if d.write {
-			if f, err = openDisk(d.path, os.O_RDWR|os.O_CREATE, d.direct); err != nil {
-				logf("disk %s: open: %v", d.name, err)
-				return
-			}
-			if err := f.Truncate(d.size); err != nil {
-				logf("disk %s: truncate: %v", d.name, err)
-			}
-		} else {
-			if err = ensureDiskFile(d.path, d.size, d.block); err != nil {
-				logf("disk %s: %v", d.name, err)
-				return
-			}
-			if f, err = openDisk(d.path, os.O_RDONLY, d.direct); err != nil {
-				logf("disk %s: open: %v", d.name, err)
-				return
-			}
+		if f, err = openDisk(d.path, os.O_RDONLY, d.direct); err != nil {
+			logf("disk %s: open: %v", d.name, err)
+			return nil, d.direct
 		}
-		logf("disk %s: about %s/s over a %s file at %s", d.name,
-			humanSize(int64(d.knob.Load())), humanSize(d.size), d.path)
-		d.f = f
-	})
-	return d.f
+	}
+	logf("disk %s: about %s/s over a %s file at %s", d.name,
+		humanSize(int64(d.knob.Load())), humanSize(d.size), d.path)
+	d.f = f
+	diskFiles = append(diskFiles, f)
+	return d.f, d.direct
+}
+
+// dropDirect closes the shared handle and reopens without O_DIRECT next time.
+// It is idempotent, so several workers hitting the same failure is fine.
+func (d *diskDir) dropDirect() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.direct {
+		return
+	}
+	d.direct = false
+	if d.f != nil {
+		d.f.Close()
+	}
+	d.f, d.opened = nil, false
 }
 
 func (d *diskDir) run(seed int64) {
@@ -728,7 +801,7 @@ func (d *diskDir) run(seed int64) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		f := d.open()
+		f, wasDirect := d.file()
 		if f == nil {
 			time.Sleep(time.Second)
 			continue
@@ -747,11 +820,9 @@ func (d *diskDir) run(seed int64) {
 			_, err = f.ReadAt(buf, off)
 		}
 		if err != nil && err != io.EOF {
-			if d.direct {
+			if wasDirect {
 				logf("disk %s: %v - retrying without O_DIRECT", d.name, err)
-				f.Close()
-				d.direct = false
-				d.once = sync.Once{}
+				d.dropDirect()
 				continue
 			}
 			logf("disk %s: %v (retrying in 30s)", d.name, err)
@@ -938,13 +1009,20 @@ func startServe(addr string) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
 	mux.HandleFunc("/metrics", serveMetrics)
 	servePprof(mux)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	// WriteTimeout is deliberately unset: /down and /hang are long-lived by
+	// design. Header and idle timeouts still bound slow-client abuse.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil {
 			logf("serve: %v", err)
 		}
 	}()
-	logf("serve: listening on %s", addr)
+	logf("serve: listening on %s (no auth: bind it to a trusted address)", addr)
 }
 
 // servePprof mounts the standard Go profilers on our own mux, so nothing is
@@ -997,9 +1075,20 @@ func serveSlow(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveStatus(w http.ResponseWriter, r *http.Request) {
-	code := intQuery(r, "code", http.StatusInternalServerError)
+	code := statusFromQuery(r, http.StatusInternalServerError)
 	w.WriteHeader(code)
 	fmt.Fprintf(w, "status %d\n", code)
+}
+
+// statusFromQuery reads a valid HTTP status from ?code=, clamping to 100-599.
+// WriteHeader panics below 100, and the standard library would tear the
+// connection down; a bad code is answered as a plain 400 instead.
+func statusFromQuery(r *http.Request, def int) int {
+	code := intQuery(r, "code", def)
+	if code < 100 || code > 599 {
+		return http.StatusBadRequest
+	}
+	return code
 }
 
 func serveFlaky(w http.ResponseWriter, r *http.Request) {
@@ -1010,7 +1099,7 @@ func serveFlaky(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if rand.Float64() < p {
-		code := intQuery(r, "code", http.StatusServiceUnavailable)
+		code := statusFromQuery(r, http.StatusServiceUnavailable)
 		w.WriteHeader(code)
 		fmt.Fprintf(w, "injected %d\n", code)
 		return
@@ -1032,35 +1121,54 @@ func serveControl(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(knobState())
 		return
 	}
-	apply := func(name string, k *atomic.Int64, mult int64) bool {
+	// Parse and validate everything first, then commit: a bad field must not
+	// leave the earlier ones applied.
+	type edit struct {
+		k   *atomic.Int64
+		val int64
+	}
+	var pending []edit
+	add := func(name string, k *atomic.Int64, mult, min, max int64) bool {
 		v := q.Get(name)
 		if v == "" {
 			return true
 		}
 		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			http.Error(w, name+": "+err.Error(), http.StatusBadRequest)
+		if err != nil || n < min || n > max {
+			http.Error(w, fmt.Sprintf("%s must be an integer between %d and %d", name, min, max), http.StatusBadRequest)
 			return false
 		}
-		k.Store(n * mult)
+		if name == "cpu" {
+			// An explicit CPU target overrides a running -schedule.
+			clearSchedule()
+		}
+		pending = append(pending, edit{k, n * mult})
 		return true
 	}
-	if !apply("cpu", &knobs.cpuPct, 1) ||
-		!apply("duty", &knobs.duty, 1) ||
-		!apply("net-down", &knobs.netDown, 1e6/8) ||
-		!apply("net-up", &knobs.netUp, 1e6/8) ||
-		!apply("disk-read", &knobs.diskRead, 1e6) ||
-		!apply("disk-write", &knobs.diskWrite, 1e6) ||
-		!apply("mem-bw", &knobs.memBW, 1e6) {
+	const big = 1_000_000
+	if !add("cpu", &knobs.cpuPct, 1, 0, 100) ||
+		!add("duty", &knobs.duty, 1, 1, 100) ||
+		!add("net-down", &knobs.netDown, 1e6/8, 0, big) ||
+		!add("net-up", &knobs.netUp, 1e6/8, 0, big) ||
+		!add("disk-read", &knobs.diskRead, 1e6, 0, big) ||
+		!add("disk-write", &knobs.diskWrite, 1e6, 0, big) ||
+		!add("mem-bw", &knobs.memBW, 1e6, 0, big) {
 		return
 	}
+	var cycleNs int64 = -1
 	if v := q.Get("cycle"); v != "" {
 		d, err := time.ParseDuration(v)
-		if err != nil {
-			http.Error(w, "cycle: "+err.Error(), http.StatusBadRequest)
+		if err != nil || d <= 0 {
+			http.Error(w, "cycle must be a positive duration, e.g. 30s", http.StatusBadRequest)
 			return
 		}
-		knobs.cycleNs.Store(int64(d))
+		cycleNs = int64(d)
+	}
+	for _, e := range pending {
+		e.k.Store(e.val)
+	}
+	if cycleNs >= 0 {
+		knobs.cycleNs.Store(cycleNs)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(knobState())
@@ -1140,6 +1248,9 @@ func applyStep(s profileStep) {
 			k.Store(int64(*p) * mult)
 		}
 	}
+	if s.CPU != nil {
+		clearSchedule() // an explicit CPU target overrides a running -schedule
+	}
 	set(s.CPU, &knobs.cpuPct, 1)
 	set(s.NetDown, &knobs.netDown, 1e6/8)
 	set(s.NetUp, &knobs.netUp, 1e6/8)
@@ -1181,19 +1292,23 @@ func writeReport(path string) {
 	}
 	type dim struct {
 		TargetBytesPerSecond int64   `json:"target_bytes_per_second"`
+		ExpectedBytes        int64   `json:"expected_bytes_total"`
 		Bytes                int64   `json:"bytes_total"`
 		MeasuredBytesPerSec  float64 `json:"measured_bytes_per_second"`
+	}
+	report := func(k, ctr, exp *atomic.Int64) dim {
+		return dim{k.Load(), exp.Load(), ctr.Load(), float64(ctr.Load()) / el}
 	}
 	r := map[string]any{
 		"version":            version,
 		"uptime_seconds":     el,
 		"cpu_target_percent": knobs.cpuPct.Load(),
 		"mem_target_bytes":   tMem,
-		"net_down":           dim{knobs.netDown.Load(), statNetDown.Load(), float64(statNetDown.Load()) / el},
-		"net_up":             dim{knobs.netUp.Load(), statNetUp.Load(), float64(statNetUp.Load()) / el},
-		"disk_read":          dim{knobs.diskRead.Load(), statDiskRead.Load(), float64(statDiskRead.Load()) / el},
-		"disk_write":         dim{knobs.diskWrite.Load(), statDiskWrite.Load(), float64(statDiskWrite.Load()) / el},
-		"mem_bw":             dim{knobs.memBW.Load(), statMemBW.Load(), float64(statMemBW.Load()) / el},
+		"net_down":           report(&knobs.netDown, &statNetDown, &expNetDown),
+		"net_up":             report(&knobs.netUp, &statNetUp, &expNetUp),
+		"disk_read":          report(&knobs.diskRead, &statDiskRead, &expDiskRead),
+		"disk_write":         report(&knobs.diskWrite, &statDiskWrite, &expDiskWrite),
+		"mem_bw":             report(&knobs.memBW, &statMemBW, &expMemBW),
 	}
 	b, _ := json.MarshalIndent(r, "", "  ")
 	if err := os.WriteFile(path, b, 0o644); err != nil {
@@ -1239,8 +1354,8 @@ func humanSize(n int64) string {
 }
 
 // availBytes reports how much can still be allocated safely: the lesser of what
-// the host has free and what this cgroup has left. On macOS it is the free plus
-// speculative page pool; elsewhere the check is skipped (0).
+// the host has free and what this cgroup has left. On macOS it is the free,
+// speculative and file-backed page pools; elsewhere the check is skipped (0).
 func availBytes() int64 {
 	switch runtime.GOOS {
 	case "linux":
@@ -1257,32 +1372,38 @@ func availBytes() int64 {
 }
 
 func darwinAvail() int64 {
-	free, spec, page, ok := darwinVM()
+	free, speculative, external, page, ok := darwinVM()
 	if !ok {
 		return 0
 	}
-	return (free + spec) * page
+	// free + speculative + external. External pages are file-backed and clean,
+	// so the kernel evicts them to satisfy an allocation; free alone is tiny on
+	// a healthy Mac and would refuse almost every request. macOS exposes no
+	// inactive count via sysctl, so this is the usable proxy.
+	return (free + speculative + external) * page
 }
 
-// darwinVM reads the free and speculative page counts and the page size. There
-// is no cgo and no stdlib binding for host_statistics on macOS, so this shells
-// out to sysctl; it never runs on the Linux image.
-func darwinVM() (free, speculative, pagesize int64, ok bool) {
-	out, err := exec.Command("sysctl", "-n", "vm.page_free_count", "vm.page_speculative_count", "hw.pagesize").Output()
+// darwinVM reads the page counts and the page size. There is no cgo and no
+// stdlib binding for host_statistics on macOS, so this shells out to sysctl; it
+// never runs on the Linux image.
+func darwinVM() (free, speculative, external, pagesize int64, ok bool) {
+	out, err := exec.Command("sysctl", "-n",
+		"vm.page_free_count", "vm.page_speculative_count", "vm.page_pageable_external_count", "hw.pagesize").Output()
 	if err != nil {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, false
 	}
 	f := strings.Fields(string(out))
-	if len(f) < 3 {
-		return 0, 0, 0, false
+	if len(f) < 4 {
+		return 0, 0, 0, 0, false
 	}
 	free, _ = strconv.ParseInt(f[0], 10, 64)
 	speculative, _ = strconv.ParseInt(f[1], 10, 64)
-	pagesize, _ = strconv.ParseInt(f[2], 10, 64)
+	external, _ = strconv.ParseInt(f[2], 10, 64)
+	pagesize, _ = strconv.ParseInt(f[3], 10, 64)
 	if pagesize <= 0 {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, false
 	}
-	return free, speculative, pagesize, true
+	return free, speculative, external, pagesize, true
 }
 
 // meminfo reads one field out of /proc/meminfo, in bytes. Returns 0 if absent.
@@ -1355,6 +1476,42 @@ func reserveFor() int64 {
 	return reserveFromBudget(memBudget())
 }
 
+// memAllowance clamps a requested memory size to what can safely be committed,
+// after the reserve and whatever is already held. It logs what it did; a return
+// of 0 means the request was refused. Where the platform gives no visibility
+// (availBytes returns 0) the request is passed through unclamped.
+func memAllowance(requested int64, label string, held int64) int64 {
+	avail := availBytes()
+	if avail <= 0 {
+		logf("%s: cannot read available memory on this platform, holding %s unverified",
+			label, humanSize(requested))
+		return requested
+	}
+	src := "host"
+	if runtime.GOOS == "linux" {
+		if cg := cgroupAvail(); cg > 0 && cg <= avail {
+			src, avail = "cgroup", cg
+		}
+	}
+	reserve := reserveFor()
+	safe := avail - reserve - held
+	switch {
+	case safe < minMem:
+		logf("%s: only %s available, less than %s once the %s reserve is kept - skipping",
+			label, humanSize(avail), humanSize(minMem), humanSize(reserve))
+		return 0
+	case requested > safe:
+		extra := ""
+		if held > 0 {
+			extra = fmt.Sprintf(" and %s already held", humanSize(held))
+		}
+		logf("%s: %s requested, holding %s instead (%s has %s available, less a %s reserve%s)",
+			label, humanSize(requested), humanSize(safe), src, humanSize(avail), humanSize(reserve), extra)
+		return safe
+	}
+	return requested
+}
+
 // cgroupAvail reports the headroom left in this cgroup, or 0 when unconstrained.
 //
 // Inside a container /proc/meminfo describes the host, not the cgroup limit.
@@ -1408,7 +1565,7 @@ func applyConfig() {
 		env := "STAYBUSY_" + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
 		if v, ok := os.LookupEnv(env); ok {
 			if err := flag.Set(f.Name, v); err != nil {
-				fmt.Printf("%s: %v\n", env, err)
+				fmt.Printf("%s=%q: %v\n", env, v, hintDuration(f, err))
 				os.Exit(2)
 			}
 			set[f.Name] = true
@@ -1432,10 +1589,21 @@ func applyConfig() {
 			continue
 		}
 		if err := flag.Set(k, configValue(v)); err != nil {
-			fmt.Printf("-config: %s: %v\n", k, err)
+			fmt.Printf("-config: %s=%v: %v\n", k, configValue(v), hintDuration(flag.Lookup(k), err))
 			os.Exit(2)
 		}
 	}
+}
+
+// hintDuration adds a unit hint when a duration flag was given a bare number.
+func hintDuration(f *flag.Flag, err error) error {
+	if f == nil {
+		return err
+	}
+	if f.Name == "duration" || f.Name == "cycle" || f.Name == "ramp" {
+		return fmt.Errorf("%v (a duration needs a unit, e.g. 30m, 1h)", err)
+	}
+	return err
 }
 
 func configValue(v any) string {
@@ -1461,6 +1629,11 @@ func diskRate(mbs, iops int, block int64) int64 {
 func cleanup() {
 	stopProcs()
 	for _, f := range fdHold {
+		f.Close()
+	}
+	// Close disk handles before removing: Windows refuses to unlink an open
+	// file, which would leave the temporary behind.
+	for _, f := range diskFiles {
 		f.Close()
 	}
 	for _, p := range diskCleanup {
@@ -1577,24 +1750,7 @@ func main() {
 		startCPU(*flagCPU, *flagCores, *flagPerCore, *flagDuty, *flagCycle, *flagRamp, schedule)
 	}
 	if mem > 0 {
-		reserve := reserveFor()
-		if avail := availBytes(); avail > 0 {
-			safe := avail - reserve
-			switch {
-			case safe < minMem:
-				logf("mem: only %s available, less than %s once the %s reserve is kept - skipping",
-					humanSize(avail), humanSize(minMem), humanSize(reserve))
-				mem = 0
-			case mem > safe:
-				src := "host"
-				if cg := cgroupAvail(); cg > 0 && cg <= avail {
-					src = "cgroup"
-				}
-				logf("mem: %s requested, holding %s instead (%s has %s available, less a %s reserve)",
-					humanSize(mem), humanSize(safe), src, humanSize(avail), humanSize(reserve))
-				mem = safe
-			}
-		}
+		mem = memAllowance(mem, "mem", 0)
 		if mem > 0 {
 			logf("mem: holding %s", humanSize(mem))
 			go eatMem(mem)
@@ -1649,11 +1805,11 @@ func main() {
 		runProfile(steps)
 	}
 
-	// Not a bare `select {}`: with only -mem set, the allocating goroutine
-	// finishes and leaves nothing runnable, which the runtime reports as a
-	// deadlock and panics on. The pending timer keeps the process off that path,
-	// and the same select turns Ctrl-C / SIGTERM into a clean exit - SIGTERM
-	// being what `docker stop` sends.
+	// Wait for a signal or the duration. The liveness ticker is what keeps an
+	// otherwise idle process off the runtime's deadlock detector: with only -mem
+	// set, the allocating goroutine finishes and leaves nothing runnable, which
+	// the runtime reports as a deadlock and panics on. A pending timer avoids
+	// that, and unlike the old one-shot select it does not end the process.
 	var duration <-chan time.Time
 	if *flagDuration > 0 {
 		duration = time.NewTimer(*flagDuration).C
@@ -1662,15 +1818,14 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	exitCode := 0
-	select {
-	case s := <-stop:
-		logf("%s received, exiting", s)
-	case <-duration:
+	switch waitExit(stop, duration, time.NewTicker(time.Hour).C) {
+	case "signal":
+		// already logged
+	case "duration":
 		logf("duration %s reached, exiting", flagDuration.Round(time.Second))
 		if *flagCheck {
 			exitCode = checkRates()
 		}
-	case <-time.After(24 * time.Hour):
 	}
 	if *flagReport != "" {
 		writeReport(*flagReport)
@@ -1678,6 +1833,23 @@ func main() {
 	cleanup()
 	if exitCode != 0 {
 		os.Exit(exitCode)
+	}
+}
+
+// waitExit blocks until a signal arrives or the duration fires, ignoring liveness
+// ticks. It returns "signal" or "duration". A nil duration channel never fires.
+func waitExit(stop <-chan os.Signal, duration, tick <-chan time.Time) string {
+	for {
+		select {
+		case s := <-stop:
+			logf("%s received, exiting", s)
+			return "signal"
+		case <-duration:
+			return "duration"
+		case <-tick:
+			// liveness only; keeps a timer pending so an idle process is not
+			// mistaken for a deadlock
+		}
 	}
 }
 

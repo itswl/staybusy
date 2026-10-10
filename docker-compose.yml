@@ -11,9 +11,11 @@ services:
     # command: ["-cpu", "40", "-duty", "10"]
     # both network directions
     # command: ["-cpu", "25", "-net-down", "20", "-net-up", "10"]
-    # disk load (needs a writable volume at /tmp)
+    # disk load and -report use /tmp, which is already writable in the image;
+    # add a tmpfs to keep the file off the container layer and cap it
     # command: ["-disk-write", "50", "-disk-size", "512M"]
-    # load target + metrics for other instances to hit
+    # tmpfs: ["/tmp:rw,size=1g,mode=1777"]
+    # load target + metrics for other instances to hit (no auth - keep it private)
     # command: ["-serve", ":8080"]
     # ports: ["8080:8080"]
     # holding memory as well - raise mem_limit to match, or the request is clamped

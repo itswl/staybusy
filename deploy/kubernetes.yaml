@@ -18,6 +18,9 @@ spec:
       labels:
         app: staybusy
     spec:
+      # fsGroup so the emptyDir mounted at /tmp is writable by the container user.
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: staybusy
           image: ghcr.io/you/staybusy:latest
@@ -31,3 +34,12 @@ spec:
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534
+          # Writable scratch space for the disk dimension and -report; bounded so
+          # a runaway disk file cannot fill the node. Raise it for larger sizes.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

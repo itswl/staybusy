@@ -164,6 +164,11 @@ of the two budgets is used.
 
 Held memory is released when the process exits; the kernel reclaims it.
 
+The clamp reads the host's free memory on Linux and macOS (free plus
+speculative pages there). Windows offers nothing standard-library-readable here,
+so `-mem`/`-mem-bw` proceed unverified and say so in the log — take care with a
+size on a Windows box.
+
 ## Network
 
 Both directions, independently, in Mbps. They run at the same time:
@@ -240,6 +245,12 @@ target, which shows up as memory bandwidth rather than resident set:
 staybusy -mem-bw 2000 -mem-bw-size 512M       # 2 GB/s of stream traffic
 ```
 
+The buffer goes through the same budget and reserve as `-mem`, so a small cgroup
+clamps it (or refuses it) rather than being walked into an OOM. The loop is
+single-threaded and touches every byte, so it occupies one core and the figure
+counted is the logical read-modify-write rate; the memory bus itself sees more,
+since each byte is read and written. It is a bandwidth load, not a free one.
+
 ## Processes, threads and file descriptors
 
 Three knobs that test limits rather than throughput:
@@ -282,7 +293,11 @@ staybusy -net-up 50   -net-up-url   http://host:8080/up
 
 The fault endpoints (`/slow`, `/status`, `/flaky`, `/hang`) are for testing
 timeouts, retries, circuit breakers and load-balancer eviction against a target
-you control.
+you control. Status codes are clamped to the valid 100–599 range.
+
+> `-serve` has no authentication: `/control` can change the load and `/hang` and
+> `/slow` occupy connections, and `-serve :8080` binds every interface. Bind it to
+> a trusted address (e.g. `127.0.0.1:8080`) or keep it off any shared network.
 
 ## Runtime control and profiles
 
@@ -296,9 +311,14 @@ curl http://host:8080/control            # GET reports the current targets
 ```
 
 CPU, network, disk and memory-bandwidth workers are always present under
-`-serve`, so any of them can be turned on from zero. `-profile` scripts the same
-knobs over time from a JSON file of steps — each step is held for its `duration`,
-absent fields are left unchanged, and the last state is held at the end:
+`-serve`, so any of them can be turned on from zero. Values are validated against
+the flag ranges (CPU 0–100, duty 1–100) and applied atomically: if any field is
+rejected the request is answered `400` and nothing changes. Setting `cpu` cancels
+a running `-schedule`, which would otherwise ignore it.
+
+`-profile` scripts the same knobs over time from a JSON file of steps — each step
+is held for its `duration`, absent fields are left unchanged, and the last state
+is held at the end:
 
 ```json
 [
@@ -321,12 +341,15 @@ staybusy -net-down 100 -duration 60s -check    # exit 1 if it never got near 100
 
 `-check` compares against the target *over the whole run*, accounting for `-duty`,
 `-profile` and any `/control` changes, so a ramped or pulsed run is measured
-against what it actually asked for. The bar is deliberately loose — a short run
-spends its first seconds warming up — so treat `-check` as a coarse smoke test,
-not a measurement.
+against what it actually asked for. The duty window is sampled, not averaged by
+fraction — `-duty` is a square wave, so a run that sits entirely inside the busy
+leg is held to the full rate. The bar is deliberately loose — a short run spends
+its first seconds warming up — so treat `-check` as a coarse smoke test, not a
+measurement.
 
-`-report results.json` writes the achieved-versus-expected totals for every
-dimension on exit, for CI artifacts. `-log-json` emits one JSON object per line
+`-report results.json` writes each dimension's target, `expected_bytes_total`
+(the same integral `-check` uses) and achieved bytes and rate on exit, for CI
+artifacts. `-log-json` emits one JSON object per line
 (`{"time":...,"msg":...}`) instead of timestamped text.
 
 ## Configuration
@@ -347,7 +370,9 @@ alternative is a long `args:` list.
 
 The image is built `FROM scratch`. A static binary needs no libc, no shell and no
 runtime, so the image holds one executable and a CA bundle, and runs as
-`nobody` (65534). Published for `linux/amd64` and `linux/arm64`.
+`nobody` (65534). It ships a `/tmp` owned by that user (scratch has none), which
+the disk dimension and `-report` need. Published for `linux/amd64` and
+`linux/arm64`.
 
 ```bash
 # continuous 25%
@@ -395,8 +420,10 @@ Each of these cost a debugging session:
 - **The main goroutine cannot block on `select {}`.** With only `-mem` set, the
   allocating goroutine finishes and leaves nothing runnable, which the runtime
   reports as a deadlock and panics on. A pending timer keeps the process off that
-  path, and the same select turns SIGTERM — what `docker stop` sends — into a
-  clean exit.
+  path. That timer started life as a one-shot 24h `time.After` with an empty
+  branch, which stopped making sense once `-duration` shared the same select: a
+  long-lived run exited silently at the 24-hour mark. The wait is a loop now, and
+  the liveness tick just keeps a timer pending.
 - **A byte-rate bucket has to rescale its burst with its rate.** The bucket was
   built once from the initial rate and only its rate changed later, so a disk block
   larger than the stale burst was charged a fraction of its size and a 20 MB/s read

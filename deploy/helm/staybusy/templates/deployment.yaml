@@ -23,9 +23,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      # fsGroup so the mounted emptyDir under /tmp is writable by the non-root
+      # container user (65534).
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: staybusy
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.args }}
           args:
@@ -49,6 +53,13 @@ spec:
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

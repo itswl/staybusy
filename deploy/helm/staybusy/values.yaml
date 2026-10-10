@@ -1,7 +1,9 @@
 # Set this to your own registry before installing.
 image:
   repository: ghcr.io/you/staybusy
-  tag: latest
+  # Empty means the chart's appVersion (a released tag). Do not use "latest"
+  # with IfNotPresent: nodes that already cached it will never pull a new one.
+  tag: ""
   pullPolicy: IfNotPresent
 
 # staybusy arguments. Keep the image default (["-cpu","25"]) by leaving this empty.
@@ -21,7 +23,14 @@ resources:
   limits:
     memory: 64Mi
 
-# Expose /metrics, /healthz and the load endpoint. Requires -serve in args.
+# Writable scratch space for the disk dimension and -report; bounded so a
+# runaway disk file cannot fill the node. Raise it for larger -disk-size.
+tmp:
+  sizeLimit: 1Gi
+
+# Expose /metrics, /healthz and the load endpoint. This requires -serve in args
+# (the chart refuses to render otherwise), and warning: the control plane is
+# unauthenticated, so restrict who can reach it.
 service:
   enabled: false
   port: 8080

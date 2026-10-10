@@ -1,8 +1,13 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -325,5 +330,177 @@ func TestDarwinAvail(t *testing.T) {
 	}
 	if got := darwinAvail(); got <= 0 {
 		t.Errorf("darwinAvail() = %d, want > 0", got)
+	}
+}
+
+func TestWaitExit(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	tick := make(chan time.Time, 1)
+	dur := make(chan time.Time, 1)
+	done := make(chan string, 1)
+	go func() { done <- waitExit(stop, dur, tick) }()
+
+	// A liveness tick must not end the wait.
+	tick <- time.Now()
+	select {
+	case r := <-done:
+		t.Fatalf("liveness tick ended the wait: %q", r)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	dur <- time.Now()
+	if r := <-done; r != "duration" {
+		t.Fatalf("got %q, want duration", r)
+	}
+
+	// A signal ends it too.
+	stop2 := make(chan os.Signal, 1)
+	done2 := make(chan string, 1)
+	go func() { done2 <- waitExit(stop2, nil, tick) }()
+	stop2 <- syscall.SIGTERM
+	if r := <-done2; r != "signal" {
+		t.Fatalf("got %q, want signal", r)
+	}
+}
+
+func TestServeDown(t *testing.T) {
+	rec := httptest.NewRecorder()
+	serveDown(rec, httptest.NewRequest("GET", "/down?bytes=1000", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 1000 {
+		t.Errorf("body = %d bytes, want 1000", rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Length"); got != "1000" {
+		t.Errorf("Content-Length = %q, want 1000", got)
+	}
+}
+
+func TestServeStatusClamps(t *testing.T) {
+	for _, c := range []struct {
+		q    string
+		want int
+	}{
+		{"?code=418", 418},
+		{"?code=0", http.StatusBadRequest},   // would panic WriteHeader
+		{"?code=999", http.StatusBadRequest}, // out of range
+		{"", http.StatusInternalServerError}, // default
+	} {
+		rec := httptest.NewRecorder()
+		serveStatus(rec, httptest.NewRequest("GET", "/status"+c.q, nil))
+		if rec.Code != c.want {
+			t.Errorf("status%s code = %d, want %d", c.q, rec.Code, c.want)
+		}
+	}
+}
+
+func TestServeFlaky(t *testing.T) {
+	rec := httptest.NewRecorder()
+	serveFlaky(rec, httptest.NewRequest("GET", "/flaky?p=1&code=503", nil))
+	if rec.Code != 503 {
+		t.Errorf("p=1 code = %d, want 503", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	serveFlaky(rec, httptest.NewRequest("GET", "/flaky?p=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("p=0 code = %d, want 200", rec.Code)
+	}
+	// code=0 is clamped rather than panicking WriteHeader
+	rec = httptest.NewRecorder()
+	serveFlaky(rec, httptest.NewRequest("GET", "/flaky?p=1&code=0", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("p=1&code=0 code = %d, want 400", rec.Code)
+	}
+}
+
+func TestServeUp(t *testing.T) {
+	rec := httptest.NewRecorder()
+	serveUp(rec, httptest.NewRequest("POST", "/up", strings.NewReader("hello")))
+	if rec.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200", rec.Code)
+	}
+}
+
+func TestServeControl(t *testing.T) {
+	knobs.cpuPct.Store(0)
+	knobs.netDown.Store(0)
+	knobs.duty.Store(100)
+
+	rec := httptest.NewRecorder()
+	serveControl(rec, httptest.NewRequest("POST", "/control?cpu=50&net-down=8&duty=25", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if got := knobs.cpuPct.Load(); got != 50 {
+		t.Errorf("cpuPct = %d, want 50", got)
+	}
+	if got := knobs.netDown.Load(); got != 1e6 { // 8 Mbps
+		t.Errorf("netDown = %d, want 1000000", got)
+	}
+	if got := knobs.duty.Load(); got != 25 {
+		t.Errorf("duty = %d, want 25", got)
+	}
+
+	// A bad field must not apply the good ones that came before it.
+	before := knobs.cpuPct.Load()
+	rec = httptest.NewRecorder()
+	serveControl(rec, httptest.NewRequest("POST", "/control?cpu=90&net-down=abc", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("code = %d, want 400", rec.Code)
+	}
+	if got := knobs.cpuPct.Load(); got != before {
+		t.Errorf("cpuPct changed to %d despite a bad field; want %d", got, before)
+	}
+
+	// out-of-range values are rejected
+	for _, q := range []string{"?duty=0", "?cpu=101", "?cycle=0s"} {
+		rec = httptest.NewRecorder()
+		serveControl(rec, httptest.NewRequest("POST", "/control"+q, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST /control%s code = %d, want 400", q, rec.Code)
+		}
+	}
+
+	// GET reports without changing anything
+	rec = httptest.NewRecorder()
+	serveControl(rec, httptest.NewRequest("GET", "/control?cpu=1", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "cpu_percent") {
+		t.Errorf("GET /control = %d %q, want the state", rec.Code, rec.Body.String())
+	}
+}
+
+func TestControlClearsSchedule(t *testing.T) {
+	setKnobs(50, 100, time.Minute)
+	s := &cpuShape{ncpu: 2, workers: 2, schedule: []int{80, 20}, start: time.Now()}
+	activeCPU = s
+	defer func() { activeCPU = nil }()
+	if got := s.level(); got != 80 {
+		t.Fatalf("schedule not active: level = %d", got)
+	}
+	rec := httptest.NewRecorder()
+	serveControl(rec, httptest.NewRequest("POST", "/control?cpu=10", nil))
+	if got := s.level(); got != 10 {
+		t.Errorf("after control cpu=10, level = %d, want the schedule cancelled", got)
+	}
+}
+
+func TestLoadProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profile.json")
+	if err := os.WriteFile(path, []byte(`[{"duration":"1s","cpu":80},{"cpu":0}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	steps, err := loadProfile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("got %d steps, want 2", len(steps))
+	}
+	if steps[0].CPU == nil || *steps[0].CPU != 80 || steps[0].Duration == nil || *steps[0].Duration != "1s" {
+		t.Errorf("step 0 = %+v", steps[0])
+	}
+	if steps[1].Duration != nil {
+		t.Errorf("step 1 should have no duration, got %v", *steps[1].Duration)
 	}
 }
