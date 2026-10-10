@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -533,5 +534,50 @@ func TestCPUQuotaCoresOffLinux(t *testing.T) {
 	}
 	if _, ok := cpuQuotaCores(); ok {
 		t.Error("cpuQuotaCores reported a quota off Linux")
+	}
+}
+
+func TestDiskDirRetriesAfterOpenFailure(t *testing.T) {
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "afile")
+	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newDir := func(path string) *diskDir {
+		return &diskDir{
+			name: "write", path: path, size: 256 * kiB, block: 64 * kiB, write: true,
+			knob: new(atomic.Int64), ctr: new(atomic.Int64), lim: newLimiter(1),
+		}
+	}
+	// The parent is a regular file, so MkdirAll fails. The open must fail and
+	// must not be latched as opened, or the dimension would spin forever.
+	d := newDir(filepath.Join(blocked, "sub", "d.dat"))
+	d.knob.Store(1)
+	if f, _ := d.file(); f != nil {
+		t.Fatal("expected the open to fail when the parent is a file")
+	}
+	d.mu.Lock()
+	opened := d.opened
+	d.mu.Unlock()
+	if opened {
+		t.Fatal("opened latched true after a failed open: the disk would spin forever")
+	}
+	if f, _ := d.file(); f != nil {
+		t.Fatal("a retry should fail again, not return a stale nil as success")
+	}
+
+	// A good path opens, stays open, and reports success.
+	good := newDir(filepath.Join(dir, "ok", "d.dat"))
+	good.knob.Store(1)
+	f, _ := good.file()
+	if f == nil {
+		t.Fatal("expected the open to succeed on a writable path")
+	}
+	f.Close()
+	good.mu.Lock()
+	o := good.opened
+	good.mu.Unlock()
+	if !o {
+		t.Error("opened should be true after a successful open")
 	}
 }

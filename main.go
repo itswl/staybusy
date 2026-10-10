@@ -761,10 +761,11 @@ type diskDir struct {
 	ctr     *atomic.Int64
 	lim     *limiter
 
-	mu     sync.Mutex
-	direct bool
-	opened bool
-	f      *os.File
+	mu      sync.Mutex
+	direct  bool
+	opened  bool
+	f       *os.File
+	lastErr time.Time
 }
 
 // file returns the shared handle, opening it on first use. The bool reports
@@ -776,36 +777,46 @@ func (d *diskDir) file() (*os.File, bool) {
 	if d.opened {
 		return d.f, d.direct
 	}
-	d.opened = true
-	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
-		logf("disk %s: %v", d.name, err)
+	f, err := d.openLocked()
+	if err != nil {
+		// Leave opened false so the next call retries: a mount that is not ready
+		// yet, or a transient permission problem, must not disable the dimension
+		// for the rest of the run. Log at most once a minute so a device that
+		// stays down does not flood.
+		if time.Since(d.lastErr) >= time.Minute {
+			logf("disk %s: %v (retrying)", d.name, err)
+			d.lastErr = time.Now()
+		}
 		return nil, d.direct
 	}
-	var f *os.File
-	var err error
-	if d.write {
-		if f, err = openDisk(d.path, os.O_RDWR|os.O_CREATE, d.direct); err != nil {
-			logf("disk %s: open: %v", d.name, err)
-			return nil, d.direct
-		}
-		if err := f.Truncate(d.size); err != nil {
-			logf("disk %s: truncate: %v", d.name, err)
-		}
-	} else {
-		if err = ensureDiskFile(d.path, d.size, d.block); err != nil {
-			logf("disk %s: %v", d.name, err)
-			return nil, d.direct
-		}
-		if f, err = openDisk(d.path, os.O_RDONLY, d.direct); err != nil {
-			logf("disk %s: open: %v", d.name, err)
-			return nil, d.direct
-		}
-	}
+	d.f, d.opened = f, true
+	diskFiles = append(diskFiles, f)
 	logf("disk %s: about %s/s over a %s file at %s", d.name,
 		humanSize(int64(d.knob.Load())), humanSize(d.size), d.path)
-	d.f = f
-	diskFiles = append(diskFiles, f)
 	return d.f, d.direct
+}
+
+// openLocked performs the actual open and setup. It is called with d.mu held and
+// leaves nothing half-done: on any failure the caller keeps opened false.
+func (d *diskDir) openLocked() (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+		return nil, err
+	}
+	if d.write {
+		f, err := openDisk(d.path, os.O_RDWR|os.O_CREATE, d.direct)
+		if err != nil {
+			return nil, err
+		}
+		if err := f.Truncate(d.size); err != nil {
+			f.Close()
+			return nil, err
+		}
+		return f, nil
+	}
+	if err := ensureDiskFile(d.path, d.size, d.block); err != nil {
+		return nil, err
+	}
+	return openDisk(d.path, os.O_RDONLY, d.direct)
 }
 
 // dropDirect closes the shared handle and reopens without O_DIRECT next time.
@@ -926,11 +937,12 @@ type diskParams struct {
 }
 
 // openDisk opens the disk file, adding O_DIRECT on Linux when asked. If the
-// direct open fails (a filesystem that does not support it) it retries plainly.
+// direct open is rejected (a filesystem that does not support it) it falls back
+// to a plain open silently; a plain-open failure is returned to the caller,
+// which logs it at most once a minute.
 func openDisk(path string, flags int, direct bool) (*os.File, error) {
 	f, err := os.OpenFile(path, flags|directFlag(direct), 0o644)
 	if err != nil && direct {
-		logf("disk: O_DIRECT open failed (%v), falling back", err)
 		return os.OpenFile(path, flags, 0o644)
 	}
 	return f, err
