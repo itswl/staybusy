@@ -164,10 +164,11 @@ of the two budgets is used.
 
 Held memory is released when the process exits; the kernel reclaims it.
 
-The clamp reads the host's free memory on Linux and macOS (free plus
-speculative pages there). Windows offers nothing standard-library-readable here,
-so `-mem`/`-mem-bw` proceed unverified and say so in the log — take care with a
-size on a Windows box.
+The clamp reads the host's free memory on Linux (cgroup-aware) and macOS (free
+plus speculative and file-backed pages). Windows has no standard-library binding
+and this stays a single portable source, so it is asked through `wmic`, or
+PowerShell when `wmic` is unavailable; if neither answers, `-mem`/`-mem-bw`
+proceed with a warning that the size is unverified.
 
 ## Network
 

@@ -1353,58 +1353,83 @@ func humanSize(n int64) string {
 	}
 }
 
-// availBytes reports how much can still be allocated safely: the lesser of what
-// the host has free and what this cgroup has left. On macOS it is the free,
-// speculative and file-backed page pools; elsewhere the check is skipped (0).
-func availBytes() int64 {
+// memInfo reports how much memory can safely be allocated (avail), the total
+// this process may use (total), and where the figures came from ("host" or
+// "cgroup"). avail is 0 when the platform gives no visibility, and callers then
+// skip the check. Keeping this in one switch is what lets the whole tool stay a
+// single portable file.
+func memInfo() (avail, total int64, src string) {
 	switch runtime.GOOS {
 	case "linux":
+		// Inside a container /proc/meminfo describes the host, not the cgroup
+		// limit, so the lesser of the two is used.
 		host := hostAvail()
 		cg := cgroupAvail()
+		avail, src = host, "host"
 		if cg > 0 && (host == 0 || cg < host) {
-			return cg
+			avail, src = cg, "cgroup"
 		}
-		return host
+		if lim := cgroupLimit(); lim > 0 {
+			total = lim
+		} else {
+			total = meminfo("MemTotal:")
+		}
 	case "darwin":
-		return darwinAvail()
+		avail, total, src = darwinAvail(), darwinTotal(), "host"
+	case "windows":
+		avail, total = windowsMem()
+		if avail > 0 {
+			src = "host"
+		}
 	}
-	return 0
+	return avail, total, src
 }
 
-func darwinAvail() int64 {
-	free, speculative, external, page, ok := darwinVM()
-	if !ok {
+// reserveFromBudget scales the reserve down with the budget: 512 MiB is a sane
+// cushion on a host, but inside a 1 GiB container it would swallow half the
+// allowance. A quarter of the budget, capped at memReserve.
+func reserveFromBudget(budget int64) int64 {
+	if budget <= 0 {
+		return memReserve
+	}
+	r := budget / 4
+	if r > memReserve {
+		r = memReserve
+	}
+	return r
+}
+
+// memAllowance clamps a requested memory size to what can safely be committed,
+// after the reserve and whatever is already held. It logs what it did; a return
+// of 0 means the request was refused. Where the platform gives no visibility the
+// request is passed through with a warning.
+func memAllowance(requested int64, label string, held int64) int64 {
+	avail, total, src := memInfo()
+	if avail <= 0 {
+		logf("%s: cannot read available memory on this platform, holding %s unverified",
+			label, humanSize(requested))
+		return requested
+	}
+	reserve := reserveFromBudget(total)
+	safe := avail - reserve - held
+	switch {
+	case safe < minMem:
+		logf("%s: only %s available, less than %s once the %s reserve is kept - skipping",
+			label, humanSize(avail), humanSize(minMem), humanSize(reserve))
 		return 0
+	case requested > safe:
+		extra := ""
+		if held > 0 {
+			extra = fmt.Sprintf(" and %s already held", humanSize(held))
+		}
+		logf("%s: %s requested, holding %s instead (%s has %s available, less a %s reserve%s)",
+			label, humanSize(requested), humanSize(safe), src, humanSize(avail), humanSize(reserve), extra)
+		return safe
 	}
-	// free + speculative + external. External pages are file-backed and clean,
-	// so the kernel evicts them to satisfy an allocation; free alone is tiny on
-	// a healthy Mac and would refuse almost every request. macOS exposes no
-	// inactive count via sysctl, so this is the usable proxy.
-	return (free + speculative + external) * page
+	return requested
 }
 
-// darwinVM reads the page counts and the page size. There is no cgo and no
-// stdlib binding for host_statistics on macOS, so this shells out to sysctl; it
-// never runs on the Linux image.
-func darwinVM() (free, speculative, external, pagesize int64, ok bool) {
-	out, err := exec.Command("sysctl", "-n",
-		"vm.page_free_count", "vm.page_speculative_count", "vm.page_pageable_external_count", "hw.pagesize").Output()
-	if err != nil {
-		return 0, 0, 0, 0, false
-	}
-	f := strings.Fields(string(out))
-	if len(f) < 4 {
-		return 0, 0, 0, 0, false
-	}
-	free, _ = strconv.ParseInt(f[0], 10, 64)
-	speculative, _ = strconv.ParseInt(f[1], 10, 64)
-	external, _ = strconv.ParseInt(f[2], 10, 64)
-	pagesize, _ = strconv.ParseInt(f[3], 10, 64)
-	if pagesize <= 0 {
-		return 0, 0, 0, 0, false
-	}
-	return free, speculative, external, pagesize, true
-}
+// --- Linux ---
 
 // meminfo reads one field out of /proc/meminfo, in bytes. Returns 0 if absent.
 func meminfo(key string) int64 {
@@ -1438,86 +1463,7 @@ func cgroupLimit() int64 {
 	return 0
 }
 
-// memBudget is the total this process may use: the cgroup ceiling if there is
-// one, else the host's total. Off Linux/macOS there is nothing to read, so 0.
-func memBudget() int64 {
-	switch runtime.GOOS {
-	case "linux":
-		if lim := cgroupLimit(); lim > 0 {
-			return lim
-		}
-		return meminfo("MemTotal:")
-	case "darwin":
-		out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
-		if err != nil {
-			return 0
-		}
-		v, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-		return v
-	}
-	return 0
-}
-
-// reserveFromBudget scales the reserve down with the budget: 512 MiB is a sane
-// cushion on a host, but inside a 1 GiB container it would swallow half the
-// allowance. A quarter of the budget, capped at memReserve.
-func reserveFromBudget(budget int64) int64 {
-	if budget <= 0 {
-		return memReserve
-	}
-	r := budget / 4
-	if r > memReserve {
-		r = memReserve
-	}
-	return r
-}
-
-func reserveFor() int64 {
-	return reserveFromBudget(memBudget())
-}
-
-// memAllowance clamps a requested memory size to what can safely be committed,
-// after the reserve and whatever is already held. It logs what it did; a return
-// of 0 means the request was refused. Where the platform gives no visibility
-// (availBytes returns 0) the request is passed through unclamped.
-func memAllowance(requested int64, label string, held int64) int64 {
-	avail := availBytes()
-	if avail <= 0 {
-		logf("%s: cannot read available memory on this platform, holding %s unverified",
-			label, humanSize(requested))
-		return requested
-	}
-	src := "host"
-	if runtime.GOOS == "linux" {
-		if cg := cgroupAvail(); cg > 0 && cg <= avail {
-			src, avail = "cgroup", cg
-		}
-	}
-	reserve := reserveFor()
-	safe := avail - reserve - held
-	switch {
-	case safe < minMem:
-		logf("%s: only %s available, less than %s once the %s reserve is kept - skipping",
-			label, humanSize(avail), humanSize(minMem), humanSize(reserve))
-		return 0
-	case requested > safe:
-		extra := ""
-		if held > 0 {
-			extra = fmt.Sprintf(" and %s already held", humanSize(held))
-		}
-		logf("%s: %s requested, holding %s instead (%s has %s available, less a %s reserve%s)",
-			label, humanSize(requested), humanSize(safe), src, humanSize(avail), humanSize(reserve), extra)
-		return safe
-	}
-	return requested
-}
-
 // cgroupAvail reports the headroom left in this cgroup, or 0 when unconstrained.
-//
-// Inside a container /proc/meminfo describes the host, not the cgroup limit.
-// Consulting only that lets `docker run --memory 64m ... -mem 512M` sail past
-// the safety check and get OOM-killed by the kernel (exit 137), with nothing in
-// the log but a line claiming it allocated 512 MiB.
 func cgroupAvail() int64 {
 	max := cgroupLimit()
 	if max <= 0 {
@@ -1540,6 +1486,96 @@ func readUint(path string) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// --- macOS ---
+
+func darwinAvail() int64 {
+	free, speculative, external, page, ok := darwinVM()
+	if !ok {
+		return 0
+	}
+	// free + speculative + external. External pages are file-backed and clean,
+	// so the kernel evicts them to satisfy an allocation; free alone is tiny on
+	// a healthy Mac and would refuse almost every request. macOS exposes no
+	// inactive count via sysctl, so this is the usable proxy.
+	return (free + speculative + external) * page
+}
+
+func darwinTotal() int64 {
+	out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	return v
+}
+
+// darwinVM reads the page counts and the page size. There is no cgo and no
+// stdlib binding for host_statistics on macOS, so this shells out to sysctl; it
+// never runs on the Linux image.
+func darwinVM() (free, speculative, external, pagesize int64, ok bool) {
+	out, err := exec.Command("sysctl", "-n",
+		"vm.page_free_count", "vm.page_speculative_count", "vm.page_pageable_external_count", "hw.pagesize").Output()
+	if err != nil {
+		return 0, 0, 0, 0, false
+	}
+	f := strings.Fields(string(out))
+	if len(f) < 4 {
+		return 0, 0, 0, 0, false
+	}
+	free, _ = strconv.ParseInt(f[0], 10, 64)
+	speculative, _ = strconv.ParseInt(f[1], 10, 64)
+	external, _ = strconv.ParseInt(f[2], 10, 64)
+	pagesize, _ = strconv.ParseInt(f[3], 10, 64)
+	if pagesize <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	return free, speculative, external, pagesize, true
+}
+
+// --- Windows ---
+
+// windowsMem is a best-effort read of physical memory. There is no cgo and no
+// platform file (this stays one portable source), and syscall.NewLazyDLL only
+// exists on Windows, so the OS is asked through a command instead: wmic on older
+// builds, PowerShell on current ones. Returns 0, 0 if neither works, and the
+// caller then proceeds with a warning.
+func windowsMem() (avail, total int64) {
+	if out, err := exec.Command("wmic", "OS", "get",
+		"FreePhysicalMemory,TotalVisibleMemorySize", "/value").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+			if !ok {
+				continue
+			}
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				continue
+			}
+			switch strings.TrimSpace(k) {
+			case "FreePhysicalMemory":
+				avail = n * kiB
+			case "TotalVisibleMemorySize":
+				total = n * kiB
+			}
+		}
+		if avail > 0 && total > 0 {
+			return avail, total
+		}
+	}
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"$o=Get-CimInstance Win32_OperatingSystem; $o.FreePhysicalMemory; $o.TotalVisibleMemorySize").Output()
+	if err != nil {
+		return 0, 0
+	}
+	nums := strings.Fields(strings.TrimSpace(string(out)))
+	if len(nums) < 2 {
+		return 0, 0
+	}
+	a, _ := strconv.ParseInt(nums[0], 10, 64)
+	t, _ := strconv.ParseInt(nums[1], 10, 64)
+	return a * kiB, t * kiB
 }
 
 // logf writes one timestamped line, or a JSON object with -log-json.
