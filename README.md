@@ -37,6 +37,7 @@ from the environment or a file.
 | `-cpu` | `0` (off)<br>image `CMD` uses `25` | percentage of the **whole machine**, spread over every core |
 | `-cores` | `0` (all) | how many cores to load |
 | `-per-core` | `0` (off) | percentage of **each** loaded core; takes precedence over `-cpu` |
+| `-cpu-base` | `machine` | what `-cpu`'s percentage is relative to: `machine` (whole node) or `limit` (the cgroup CPU quota) |
 | `-duty` | `100` | percentage of time spent busy. `100` = continuous, `10` = 6 min/hour |
 | `-cycle` | `1h` | length of one duty cycle (when `-duty < 100`) or of one `-schedule` pass |
 | `-ramp` | `0` (off) | ramp CPU from 0 up to its target over this period at startup |
@@ -91,6 +92,15 @@ asked for.
 `-cores` with `-per-core` is the literal one, for when you want a specific number
 of busy cores rather than a machine-wide figure. `-per-core` wins if both are
 given, and `-cores` is capped at the core count.
+
+`-cpu` is a percentage of the whole node by default — on Linux that is
+`runtime.NumCPU()`, which in a container is the node's cores unless a cpuset is
+set. Under a cgroup CPU limit (a Kubernetes `limits.cpu`, `docker --cpus`) the
+process is throttled by the kernel, not told, so `-cpu 25` still means 25% of the
+node. To make it relative to the allocation instead, use `-cpu-base limit`:
+`-cpu 50` is then half of the allowed CPUs, read from `cpu.max` (cgroup v2) or
+`cpu.cfs_quota_us` (v1), and it falls back to the machine when no quota is set.
+This is a fractional target, so a 500m limit is not rounded away.
 
 They compose: `-cpu 15 -cores 2` concentrates a machine-wide target onto fewer
 cores, raising each to 82%. When the target is out of reach for that many cores it

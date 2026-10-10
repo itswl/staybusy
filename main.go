@@ -70,6 +70,7 @@ var (
 	flagCPU           = flag.Int("cpu", 0, "percentage of the whole machine's CPU to use while busy (1-100); 0 disables.\nLoad is spread over every core, so the figure means the same on any core count")
 	flagCores         = flag.Int("cores", 0, "how many cores to load; 0 means all of them")
 	flagPerCore       = flag.Int("per-core", 0, "percentage of each loaded core (1-100). Takes precedence over -cpu:\nuse it when you want an exact number of cores at an exact load each")
+	flagCPUBase       = flag.String("cpu-base", "machine", "what -cpu's percentage is relative to: machine (all of the node's cores)\nor limit (the cgroup CPU quota, e.g. a Kubernetes limits.cpu)")
 	flagDuty          = flag.Int("duty", 100, "percentage of time spent busy, across every dimension.\n100 = continuous; 10 means 6 minutes per hour, raising the upper decile of samples")
 	flagCycle         = flag.Duration("cycle", time.Hour, "length of one duty cycle, or of one -schedule pass")
 	flagRamp          = flag.Duration("ramp", 0, "ramp CPU from 0 up to its target over this period at startup; 0 disables")
@@ -273,8 +274,12 @@ func cpuPlan(pct, cores, perCore int) (workers, duty int, desc string) {
 // mechanism instead of starting and stopping workers as the plan changes.
 type cpuShape struct {
 	ncpu, workers int
-	ramp          time.Duration
-	start         time.Time
+	// basis is the number of cores the target percentage is relative to. 0 means
+	// the node's cores (-cpu-base machine); a cgroup quota sets it to the
+	// allocated cores (-cpu-base limit).
+	basis float64
+	ramp  time.Duration
+	start time.Time
 
 	mu       sync.Mutex
 	schedule []int
@@ -330,38 +335,72 @@ func (s *cpuShape) level() int {
 	return target
 }
 
-// workerPct turns a machine-wide level into what a single worker should spin at.
+// workerFrac is the fraction of a core a single worker should spin at: the
+// level (a percent of the basis) spread over the workers. Fractional rather than
+// integer, so a small cgroup CPU limit is not rounded away.
+func (s *cpuShape) workerFrac() float64 {
+	basis := s.basis
+	if basis <= 0 {
+		basis = float64(s.ncpu)
+	}
+	f := float64(s.level()) / 100 * basis / float64(s.workers)
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
+}
+
 func (s *cpuShape) workerPct() int {
-	p := s.level() * s.ncpu / s.workers
-	if p > 100 {
-		p = 100
-	}
-	if p < 0 {
-		p = 0
-	}
-	return p
+	return int(s.workerFrac()*100 + 0.5)
 }
 
 // startCPU builds the plan and launches one worker per core it wants to load.
 // The workers run for the life of the process; the shape and the knobs decide
 // how hard they spin, so runtime control needs nothing respawned.
 func startCPU(pct, cores, perCore, duty int, cycle, ramp time.Duration, schedule []int) {
+	ncpu := runtime.NumCPU()
 	workers, _, desc := cpuPlan(pct, cores, perCore)
 	target := pct
 	if perCore > 0 {
 		// Keep control uniform by working in machine-wide percent throughout.
-		target = perCore * workers / runtime.NumCPU()
+		target = perCore * workers / ncpu
+	}
+	// -cpu-base limit: interpret the percentage against the cgroup CPU quota
+	// rather than the whole node, and only load roughly the allocated cores.
+	basis := 0.0
+	if perCore == 0 && *flagCPUBase == "limit" {
+		if q, ok := cpuQuotaCores(); ok {
+			if q > float64(ncpu) {
+				q = float64(ncpu)
+			}
+			basis = q
+			if workers = int(math.Ceil(q)); workers < 1 {
+				workers = 1
+			} else if workers > ncpu {
+				workers = ncpu
+			}
+			desc = fmt.Sprintf("%d%% of the %g-core CPU limit", pct, q)
+		} else {
+			logf("cpu: -cpu-base limit set but no cgroup CPU quota is present, using the whole machine")
+		}
 	}
 	knobs.cpuPct.Store(int64(target))
 	knobs.duty.Store(int64(duty))
 	knobs.cycleNs.Store(int64(cycle))
 
-	s := &cpuShape{ncpu: runtime.NumCPU(), workers: workers, ramp: ramp, schedule: schedule, start: time.Now()}
+	s := &cpuShape{ncpu: ncpu, workers: workers, basis: basis, ramp: ramp, schedule: schedule, start: time.Now()}
 	activeCPU = s
 	suffix := "continuously"
 	switch {
 	case len(schedule) > 0:
-		suffix = fmt.Sprintf("cycling through %s%% of the machine every %s", joinInts(schedule), cycle)
+		where := "the machine"
+		if basis > 0 {
+			where = "the CPU limit"
+		}
+		suffix = fmt.Sprintf("cycling through %s%% of %s every %s", joinInts(schedule), where, cycle)
 	case ramp > 0:
 		suffix = "ramping up over " + ramp.String()
 	case duty < 100:
@@ -380,7 +419,7 @@ func burnCPU(s *cpuShape) {
 	const period = 100 * time.Millisecond
 	runtime.LockOSThread()
 	for {
-		busy := period * time.Duration(s.workerPct()) / 100
+		busy := time.Duration(float64(period) * s.workerFrac())
 		begin := time.Now()
 		for time.Since(begin) < busy {
 		}
@@ -1488,6 +1527,30 @@ func readUint(path string) (int64, bool) {
 	return v, true
 }
 
+// cpuQuotaCores reports the CPU the cgroup allows, in cores (quota/period), or
+// false when unconstrained or unreadable. Used by -cpu-base limit.
+func cpuQuotaCores() (float64, bool) {
+	// cgroup v2: "cpu.max" is "<quota> <period>" in microseconds, or "max".
+	if b, err := os.ReadFile("/sys/fs/cgroup/cpu.max"); err == nil {
+		f := strings.Fields(string(b))
+		if len(f) >= 2 && f[0] != "max" {
+			q, err1 := strconv.ParseFloat(f[0], 64)
+			p, err2 := strconv.ParseFloat(f[1], 64)
+			if err1 == nil && err2 == nil && q > 0 && p > 0 {
+				return q / p, true
+			}
+		}
+		return 0, false
+	}
+	// cgroup v1: quota -1 means unconstrained, which readUint rejects.
+	q, ok1 := readUint("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+	p, ok2 := readUint("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+	if ok1 && ok2 {
+		return float64(q) / float64(p), true
+	}
+	return 0, false
+}
+
 // --- macOS ---
 
 func darwinAvail() int64 {
@@ -1719,6 +1782,10 @@ func main() {
 	}
 	if *flagDiskPattern != "seq" && *flagDiskPattern != "rand" {
 		fmt.Println("-disk-pattern must be seq or rand")
+		os.Exit(2)
+	}
+	if *flagCPUBase != "machine" && *flagCPUBase != "limit" {
+		fmt.Println("-cpu-base must be machine or limit")
 		os.Exit(2)
 	}
 	for _, c := range []struct {

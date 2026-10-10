@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -502,5 +503,35 @@ func TestLoadProfile(t *testing.T) {
 	}
 	if steps[1].Duration != nil {
 		t.Errorf("step 1 should have no duration, got %v", *steps[1].Duration)
+	}
+}
+
+func TestCPUShapeLimitBasis(t *testing.T) {
+	// 50% of a 2-core limit over 2 workers = 0.5 core each
+	setKnobs(50, 100, time.Hour)
+	s := &cpuShape{ncpu: 8, workers: 2, basis: 2, start: time.Now()}
+	if got := s.workerFrac(); math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("workerFrac = %v, want 0.5", got)
+	}
+	// 100% of a 0.5-core limit over 1 worker = 0.5 core each
+	setKnobs(100, 100, time.Hour)
+	s = &cpuShape{ncpu: 8, workers: 1, basis: 0.5, start: time.Now()}
+	if got := s.workerFrac(); math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("workerFrac = %v, want 0.5", got)
+	}
+	// A basis of 0 falls back to the node's cores
+	setKnobs(50, 100, time.Hour)
+	s = &cpuShape{ncpu: 4, workers: 2, start: time.Now()}
+	if got := s.workerFrac(); math.Abs(got-1.0) > 1e-9 {
+		t.Errorf("workerFrac = %v, want 1.0 (machine basis)", got)
+	}
+}
+
+func TestCPUQuotaCoresOffLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("a Linux host may legitimately have a quota")
+	}
+	if _, ok := cpuQuotaCores(); ok {
+		t.Error("cpuQuotaCores reported a quota off Linux")
 	}
 }
