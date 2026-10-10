@@ -1,0 +1,9 @@
+apiVersion: v2
+name: staybusy
+description: Put a controlled, predictable load on a machine
+type: application
+version: 0.1.0
+appVersion: "0.8.0"
+home: https://github.com/you/staybusy
+sources:
+  - https://github.com/you/staybusy

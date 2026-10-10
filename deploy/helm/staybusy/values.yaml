@@ -1,0 +1,33 @@
+# Set this to your own registry before installing.
+image:
+  repository: ghcr.io/you/staybusy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# staybusy arguments. Keep the image default (["-cpu","25"]) by leaving this empty.
+args: ["-cpu", "25"]
+
+# Extra STAYBUSY_* environment variables, e.g.:
+#   env:
+#     - name: STAYBUSY_NET_DOWN
+#       value: "20"
+env: []
+
+# Run one instance per node to load the whole cluster.
+daemonSet: false
+replicaCount: 1
+
+resources:
+  limits:
+    memory: 64Mi
+
+# Expose /metrics, /healthz and the load endpoint. Requires -serve in args.
+service:
+  enabled: false
+  port: 8080
+  metricsAnnotations: false
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

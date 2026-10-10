@@ -1,0 +1,23 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: staybusy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- if .Values.service.metricsAnnotations }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.service.port | quote }}
+    prometheus.io/path: /metrics
+  {{- end }}
+spec:
+  selector:
+    app.kubernetes.io/name: staybusy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+{{- end }}
