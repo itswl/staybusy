@@ -38,6 +38,7 @@ alerts, reproducing resource contention, and smoke-testing capacity limits.
 | `-net-up` | `0` (off) | sustained upload rate in Mbps; runs alongside `-net-down` |
 | `-net-down-url` | Cloudflare | download source |
 | `-net-up-url` | Cloudflare | upload target |
+| `-version` | | print the version and exit |
 
 ## CPU
 
@@ -104,18 +105,20 @@ Measured on a single-core machine, process-level, with nothing else competing:
 
 ## Memory
 
-A reserve of 512 MiB is always left to the system, and the request is clamped to
-fit — holding less is better than wedging the machine:
+A reserve is always left to the system and the request is clamped to fit —
+holding less is better than wedging the machine. On a host the reserve is 512
+MiB; inside a container it scales down to a quarter of the cgroup limit, so a
+small limit does not hand most of its budget away:
 
 ```
-$ staybusy -mem 5G                        # host has 4.74 GiB available
+$ staybusy -mem 5G                             # host has 4.74 GiB available
 mem: 5.00 GiB requested, holding 4.24 GiB instead (host has 4.74 GiB available, less a 512 MiB reserve)
 
-$ docker run --memory 1g staybusy -mem 512M
-mem: 512 MiB requested, holding 509 MiB instead (cgroup has 1021 MiB available, less a 512 MiB reserve)
+$ docker run --memory 1g staybusy -mem 512M    # reserve is a quarter of 1 GiB
+mem: holding 512 MiB
 
-$ docker run --memory 64m staybusy -mem 512M
-mem: only 61 MiB available, less than 64 MiB once the 512 MiB reserve is kept - skipping
+$ docker run --memory 64m staybusy -mem 512M   # reserve is a quarter of 64 MiB
+mem: only 61 MiB available, less than 64 MiB once the 16 MiB reserve is kept - skipping
 ```
 
 **Inside a container the cgroup limit wins.** `/proc/meminfo` describes the host,
@@ -141,12 +144,11 @@ Off by default, since this is the one dimension that costs real bandwidth — th
 log line states the daily volume up front, and every five minutes reports the rate
 actually achieved.
 
-**Pacing is per block, not smoothed.** Each block goes out at line speed and the
-process then sleeps off the difference, so the instantaneous rate alternates
-between a burst and idle while the average converges on the target. Measured over
-30s, `-net-down 20 -net-up 10` gave 21.8 and 13.4 Mbps — short-window overshoot
-from exactly that effect. If you need a flat profile rather than a correct
-average, this is not the right tool.
+**Pacing is a token bucket.** Every read is charged against a byte-rate bucket, so
+the rate tracks the target continuously instead of bursting a whole block out at
+line speed and sleeping off the difference afterwards. The bucket holds at most
+200 ms of headroom (64 KiB to 4 MiB), so the worst short-window overshoot is a
+fraction of a block rather than the block itself.
 
 The upload buffer (8 MiB) is allocated on first use, so a run without `-net-up`
 does not carry it.
@@ -201,8 +203,22 @@ Each of these cost a debugging session:
   cgroup limit — see the memory section above.
 - **The main goroutine cannot block on `select {}`.** With only `-mem` set, the
   allocating goroutine finishes and leaves nothing runnable, which the runtime
-  reports as a deadlock and panics on. A sleep loop keeps a timer pending and is
-  never considered deadlocked.
+  reports as a deadlock and panics on. A pending timer keeps the process off that
+  path, and the same select turns SIGTERM — what `docker stop` sends — into a
+  clean exit.
+- **A byte-rate bucket must cap what it charges.** Charging a read larger than the
+  bucket would wait for tokens that can never accrue and hang the transfer, so the
+  charge is capped at one bucketful.
+- **A fixed memory reserve is wrong inside a container.** 512 MiB is a sane
+  cushion on a host and half of a 1 GiB cgroup, so the reserve scales to a quarter
+  of the budget.
+- **A duty cycle with a zero-length phase respawns without bound.** `-cycle 0`, or
+  a cycle shorter than one duty period, made the pulse loop spin up a fresh set of
+  workers on every iteration with no sleep between; the cycle is now validated
+  positive and the busy leg floored.
+- **`-cores` over the core count used to zero the load.** Integer division spread
+  `-cpu 5 -cores 200` over 200 workers, gave each 0%, and ran nothing. The worker
+  count is clamped to the cores, as the docs always claimed.
 - **CPU load is a duty cycle, not a spin.** Busy for N% of each 100 ms period,
   then sleep, with `runtime.LockOSThread()` pinning the goroutine so the scheduler
   cannot move it and skew the ratio.

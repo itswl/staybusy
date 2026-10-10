@@ -4,7 +4,7 @@
 //
 //	CPU     a duty-cycled busy loop, expressed as a percentage of the whole machine
 //	memory  anonymous pages, allocated and touched so they are really resident
-//	network sustained downloads throttled to a target rate
+//	network sustained transfers, up and/or down, throttled to a target rate
 //
 // Useful for exercising autoscaling rules, validating monitoring thresholds and
 // alerts, reproducing resource contention, and smoke-testing capacity limits.
@@ -17,22 +17,30 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
+
+// version is stamped at build time: -ldflags "-X main.version=v1.2.3".
+var version = "dev"
 
 const (
 	kiB = 1024
 	miB = 1024 * kiB
 	giB = 1024 * miB
 
-	// memReserve is always left to the system. Allocation is clamped to
-	// "available - memReserve"; better to hold less than to wedge the machine.
+	// memReserve is the most that is ever left to the system. Allocation is
+	// clamped to "available - reserve"; better to hold less than to wedge the
+	// machine. The reserve scales down inside a small cgroup - see reserveFor.
 	memReserve = 512 * miB
 	// minMem: below this there is no point allocating, so the dimension is skipped.
 	minMem = 64 * miB
@@ -49,6 +57,7 @@ var (
 	flagNetUp      = flag.Int("net-up", 0, "sustained upload rate in Mbps; 0 disables. Runs alongside -net-down, so\nboth directions can be driven at once")
 	flagNetDownURL = flag.String("net-down-url", "https://speed.cloudflare.com/__down?bytes=10485760", "download source (this endpoint returns 403 above 10 MB)")
 	flagNetUpURL   = flag.String("net-up-url", "https://speed.cloudflare.com/__up", "upload target")
+	flagVersion    = flag.Bool("version", false, "print the version and exit")
 )
 
 // hold keeps every allocated block reachable so the garbage collector leaves it
@@ -80,7 +89,10 @@ func cpuPlan(pct, cores, perCore int) (workers, duty int, desc string) {
 			workers, ncpu, perCore, perCore*workers/ncpu)
 	}
 	workers = cores
-	if workers <= 0 {
+	if workers <= 0 || workers > ncpu {
+		// Capped at the core count, as the docs promise. Without the upper clamp
+		// `-cpu 5 -cores 200` on an 8-core box would spread 5% over 200 workers,
+		// integer-divide each down to 0%, and run no load at all.
 		workers = ncpu
 	}
 	// Spreading pct over fewer cores means each works proportionally harder.
@@ -112,6 +124,16 @@ func startCPU(pct, cores, perCore, duty int, cycle time.Duration) {
 		return
 	}
 	burnFor := cycle * time.Duration(duty) / 100
+	// Floor the busy leg and never let it exceed the cycle. A zero-length phase
+	// would respawn every worker on each iteration with no sleep in between,
+	// spawning goroutines without bound.
+	if burnFor < time.Millisecond {
+		burnFor = time.Millisecond
+	}
+	if burnFor > cycle {
+		burnFor = cycle
+	}
+	idleFor := cycle - burnFor
 	logf("cpu: %s, %s busy every %s (duty %d%%)", desc, burnFor.Round(time.Second), cycle, duty)
 	go func() {
 		for {
@@ -121,7 +143,7 @@ func startCPU(pct, cores, perCore, duty int, cycle time.Duration) {
 			}
 			time.Sleep(burnFor)
 			close(stop)
-			time.Sleep(cycle - burnFor)
+			time.Sleep(idleFor)
 		}
 	}()
 }
@@ -166,27 +188,80 @@ func eatMem(n int64) {
 	}
 }
 
-// pushNet drives traffic in one direction, throttled to mbps: after each block
-// it works out how long that transfer should have taken at the target rate and
-// sleeps off the difference. Download and upload run as independent instances,
-// so both directions can be driven at the same time.
-func pushNet(dir string, mbps int, url string, xfer func(*http.Client, string) (int64, error)) {
+// limiter is a byte-rate token bucket. Reads are paced through it so the rate
+// stays near the target continuously, rather than bursting each block out at
+// line speed and sleeping off the difference afterwards. Still stdlib only.
+type limiter struct {
+	mu     sync.Mutex
+	rate   float64 // bytes per second
+	burst  float64 // tokens held back to absorb one burst
+	tokens float64
+	last   time.Time
+}
+
+func newLimiter(bytesPerSec float64) *limiter {
+	burst := bytesPerSec / 5 // 200 ms of headroom
+	if burst < 64*kiB {
+		burst = 64 * kiB
+	}
+	if burst > 4*miB {
+		burst = 4 * miB
+	}
+	return &limiter{rate: bytesPerSec, burst: burst, tokens: burst, last: time.Now()}
+}
+
+// wait blocks until n bytes may go out. n is charged at most a full burst so a
+// caller asking for more than the burst cannot wait forever for tokens that
+// will never accumulate.
+func (l *limiter) wait(n int) {
+	want := math.Min(float64(n), l.burst)
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		l.tokens = math.Min(l.burst, l.tokens+now.Sub(l.last).Seconds()*l.rate)
+		l.last = now
+		if l.tokens >= want {
+			l.tokens -= want
+			l.mu.Unlock()
+			return
+		}
+		need := (want - l.tokens) / l.rate
+		l.mu.Unlock()
+		time.Sleep(time.Duration(need * float64(time.Second)))
+	}
+}
+
+// throttled paces a reader through a limiter: every read is charged before the
+// next one is served, which back-pressures the socket via TCP.
+type throttled struct {
+	r io.Reader
+	l *limiter
+}
+
+func (t *throttled) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		t.l.wait(n)
+	}
+	return n, err
+}
+
+// pushNet drives traffic in one direction, throttled to mbps by a shared
+// limiter. Download and upload run as independent instances, so both directions
+// can be driven at the same time.
+func pushNet(dir string, mbps int, url string, xfer func(*http.Client, string, *limiter) (int64, error)) {
 	client := &http.Client{Timeout: 5 * time.Minute}
+	lim := newLimiter(float64(mbps) * 1e6 / 8)
 	var total int64
 	report := time.Now()
 	for {
-		start := time.Now()
-		n, err := xfer(client, url)
+		n, err := xfer(client, url, lim)
 		if err != nil {
 			logf("net %s: %v (retrying in 30s)", dir, err)
 			time.Sleep(30 * time.Second)
 			continue
 		}
 		total += n
-		want := time.Duration(float64(n) * 8 / float64(mbps) / 1e6 * float64(time.Second))
-		if d := want - time.Since(start); d > 0 {
-			time.Sleep(d)
-		}
 		if el := time.Since(report); el >= 5*time.Minute { // summarise rather than log every block
 			logf("net %s: %s over the last %s, about %.1f Mbps (target %d)",
 				dir, humanSize(total), el.Round(time.Second), float64(total)*8/el.Seconds()/1e6, mbps)
@@ -199,7 +274,7 @@ func pushNet(dir string, mbps int, url string, xfer func(*http.Client, string) (
 // an error page would otherwise count as a successful transfer and the dimension
 // would quietly do nothing (the default endpoint answers 403 with a 1-byte body
 // above 10 MB).
-func download(client *http.Client, url string) (int64, error) {
+func download(client *http.Client, url string, lim *limiter) (int64, error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "staybusy/1.0")
 	resp, err := client.Do(req)
@@ -210,7 +285,7 @@ func download(client *http.Client, url string) (int64, error) {
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("download source answered HTTP %d, try another -net-down-url", resp.StatusCode)
 	}
-	return io.Copy(io.Discard, resp.Body)
+	return io.Copy(io.Discard, &throttled{r: resp.Body, l: lim})
 }
 
 // upBlock is posted over and over. Allocated on first use rather than at
@@ -220,12 +295,13 @@ func download(client *http.Client, url string) (int64, error) {
 var upBlock []byte
 
 // upload posts one block and returns the byte count.
-func upload(client *http.Client, url string) (int64, error) {
+func upload(client *http.Client, url string, lim *limiter) (int64, error) {
 	if upBlock == nil { // only ever called from the single upload goroutine
 		upBlock = make([]byte, 8*miB)
 		rand.Read(upBlock)
 	}
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(upBlock))
+	body := &throttled{r: bytes.NewReader(upBlock), l: lim}
+	req, _ := http.NewRequest("POST", url, body)
 	req.Header.Set("User-Agent", "staybusy/1.0")
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = int64(len(upBlock))
@@ -291,18 +367,66 @@ func availBytes() int64 {
 	return host
 }
 
-func hostAvail() int64 {
+// meminfo reads one field out of /proc/meminfo, in bytes. Returns 0 if absent.
+func meminfo(key string) int64 {
 	b, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		if f := strings.Fields(line); len(f) >= 2 && f[0] == "MemAvailable:" {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == key {
 			kb, _ := strconv.ParseInt(f[1], 10, 64)
 			return kb * kiB
 		}
 	}
 	return 0
+}
+
+func hostAvail() int64 {
+	return meminfo("MemAvailable:")
+}
+
+// cgroupLimit reports this cgroup's memory ceiling, or 0 when unconstrained.
+func cgroupLimit() int64 {
+	// cgroup v2 reads "max" when unconstrained, so a parse failure is that case.
+	if max, ok := readUint("/sys/fs/cgroup/memory.max"); ok {
+		return max
+	}
+	// cgroup v1 spells unconstrained as a value near the int64 ceiling.
+	if max, ok := readUint("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok && max < 1<<62 {
+		return max
+	}
+	return 0
+}
+
+// memBudget is the total this process may use: the cgroup ceiling if there is
+// one, else the host's total. Off Linux there is nothing to read, so 0.
+func memBudget() int64 {
+	if runtime.GOOS != "linux" {
+		return 0
+	}
+	if lim := cgroupLimit(); lim > 0 {
+		return lim
+	}
+	return meminfo("MemTotal:")
+}
+
+// reserveFromBudget scales the reserve down with the budget: 512 MiB is a sane
+// cushion on a host, but inside a 1 GiB container it would swallow half the
+// allowance. A quarter of the budget, capped at memReserve.
+func reserveFromBudget(budget int64) int64 {
+	if budget <= 0 {
+		return memReserve
+	}
+	r := budget / 4
+	if r > memReserve {
+		r = memReserve
+	}
+	return r
+}
+
+func reserveFor() int64 {
+	return reserveFromBudget(memBudget())
 }
 
 // cgroupAvail reports the headroom left in this cgroup, or 0 when unconstrained.
@@ -312,18 +436,15 @@ func hostAvail() int64 {
 // the safety check and get OOM-killed by the kernel (exit 137), with nothing in
 // the log but a line claiming it allocated 512 MiB.
 func cgroupAvail() int64 {
-	// cgroup v2: the file reads "max" when unconstrained, so a parse failure
-	// is the unconstrained case.
-	if max, ok := readUint("/sys/fs/cgroup/memory.max"); ok {
-		cur, _ := readUint("/sys/fs/cgroup/memory.current")
-		return max - cur
+	max := cgroupLimit()
+	if max <= 0 {
+		return 0
 	}
-	// cgroup v1: unconstrained shows up as a value near the int64 ceiling.
-	if max, ok := readUint("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok && max < 1<<62 {
-		cur, _ := readUint("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-		return max - cur
+	cur, _ := readUint("/sys/fs/cgroup/memory.current") // cgroup v2
+	if cur == 0 {
+		cur, _ = readUint("/sys/fs/cgroup/memory/memory.usage_in_bytes") // v1
 	}
-	return 0
+	return max - cur
 }
 
 func readUint(path string) (int64, bool) {
@@ -345,17 +466,22 @@ func logf(format string, a ...any) {
 func main() {
 	flag.Parse()
 
+	if *flagVersion {
+		fmt.Println("staybusy " + version)
+		return
+	}
+
 	mem, err := parseSize(*flagMem)
 	if err != nil {
 		fmt.Println("-mem:", err)
 		os.Exit(2)
 	}
 	if *flagCPU < 0 || *flagCPU > 100 {
-		fmt.Println("-cpu must be between 1 and 100")
+		fmt.Println("-cpu must be between 0 and 100 (0 disables)")
 		os.Exit(2)
 	}
 	if *flagPerCore < 0 || *flagPerCore > 100 {
-		fmt.Println("-per-core must be between 1 and 100")
+		fmt.Println("-per-core must be between 0 and 100 (0 disables)")
 		os.Exit(2)
 	}
 	if *flagCores < 0 {
@@ -364,6 +490,14 @@ func main() {
 	}
 	if *flagDuty < 1 || *flagDuty > 100 {
 		fmt.Println("-duty must be between 1 and 100")
+		os.Exit(2)
+	}
+	if *flagCycle <= 0 {
+		fmt.Println("-cycle must be positive")
+		os.Exit(2)
+	}
+	if *flagNetDown < 0 || *flagNetUp < 0 {
+		fmt.Println("-net-down and -net-up must not be negative")
 		os.Exit(2)
 	}
 	if *flagCPU == 0 && *flagPerCore == 0 && mem == 0 && *flagNetDown == 0 && *flagNetUp == 0 {
@@ -378,12 +512,13 @@ func main() {
 	if mem > 0 {
 		// Clamp rather than warn: a warning followed by the allocation anyway
 		// is no protection at all.
+		reserve := reserveFor()
 		if avail := availBytes(); avail > 0 {
-			safe := avail - memReserve
+			safe := avail - reserve
 			switch {
 			case safe < minMem:
 				logf("mem: only %s available, less than %s once the %s reserve is kept - skipping",
-					humanSize(avail), humanSize(minMem), humanSize(memReserve))
+					humanSize(avail), humanSize(minMem), humanSize(reserve))
 				mem = 0
 			case mem > safe:
 				src := "host"
@@ -391,7 +526,7 @@ func main() {
 					src = "cgroup"
 				}
 				logf("mem: %s requested, holding %s instead (%s has %s available, less a %s reserve)",
-					humanSize(mem), humanSize(safe), src, humanSize(avail), humanSize(memReserve))
+					humanSize(mem), humanSize(safe), src, humanSize(avail), humanSize(reserve))
 				mem = safe
 			}
 		}
@@ -411,10 +546,19 @@ func main() {
 		go pushNet("up", *flagNetUp, *flagNetUpURL, upload)
 	}
 
-	// Not `select {}`: with only -mem set, the allocating goroutine finishes and
-	// leaves nothing runnable, which the runtime reports as a deadlock and panics
-	// on. A sleep loop keeps a timer pending, so it is never considered deadlocked.
+	// Not a bare `select {}`: with only -mem set, the allocating goroutine
+	// finishes and leaves nothing runnable, which the runtime reports as a
+	// deadlock and panics on. The pending timer keeps the process off that path,
+	// and the signal channel turns Ctrl-C / SIGTERM into a clean exit - SIGTERM
+	// being what `docker stop` sends.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	for {
-		time.Sleep(24 * time.Hour)
+		select {
+		case s := <-sig:
+			logf("%s received, exiting", s)
+			return
+		case <-time.After(24 * time.Hour):
+		}
 	}
 }

@@ -9,8 +9,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.23'
 
@@ -21,6 +21,9 @@ jobs:
 
       - name: vet
         run: go vet ./...
+
+      - name: test
+        run: go test ./...
 
       - name: build
         run: CGO_ENABLED=0 go build -o staybusy .
@@ -35,7 +38,7 @@ jobs:
             grep -q -- "\`$f\`" README.md || { echo "undocumented: $f"; fail=1; }
           done
           for f in $(grep -oE '`-[a-z-]+`' README.md | tr -d '`' | sort -u); do
-            ./staybusy 2>&1 | grep -q -- "^  $f " || { echo "documented but absent: $f"; fail=1; }
+            ./staybusy 2>&1 | grep -qE "^  $f( |$)" || { echo "documented but absent: $f"; fail=1; }
           done
           exit $fail
 

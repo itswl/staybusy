@@ -3,9 +3,11 @@ FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod main.go ./
 ARG TARGETOS TARGETARCH
+# stamped into the binary so -version reports the released tag
+ARG VERSION=dev
 # CGO_ENABLED=0 is what makes the binary static, and therefore scratch-compatible
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /staybusy .
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /staybusy .
 
 # ---- runtime ----
 # scratch: a static binary needs no libc, no shell and no runtime, so the image
